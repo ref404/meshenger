@@ -6,21 +6,24 @@
 ╚══════════════════════════════════════════════════════════════╝
 
 Usage:
-  python mesh_lounge.py                     # demo mode
-  python mesh_lounge.py --port /dev/ttyUSB0 # USB serial
-  python mesh_lounge.py --host 192.168.1.1  # TCP/IP
-  python mesh_lounge.py --port /dev/ttyUSB0 --baud 115200
+  python meshenger.py                       # demo mode
+  python meshenger.py --ble                 # Bluetooth LE (auto-discover)
+  python meshenger.py --ble "NodeName"      # Bluetooth LE (specific device)
+  python meshenger.py --port /dev/ttyUSB0   # USB serial
+  python meshenger.py --host 192.168.1.1    # TCP/IP
 
 Install:
-  pip install textual meshtastic pypubsub
+  pip install -r requirements.txt
 """
 
 import argparse
 import asyncio
 import json
 import math
+import os
 import random
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,11 +35,11 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
+from textual.containers import Horizontal, ScrollableContainer
 from textual.message import Message
 from textual.reactive import reactive
 from textual.strip import Strip
-from textual.widgets import Footer, Input, RichLog, Static
+from textual.widgets import Input, RichLog, Static
 
 try:
     import meshtastic.serial_interface
@@ -223,7 +226,6 @@ class HeaderBar(Static):
     connection_status = reactive("◌ OFFLINE")
     node_count = reactive(0)
     channel_name = reactive("LongFast")
-    uptime_secs = reactive(0)
     freq_info = reactive("")
 
     def __init__(self, **kwargs):
@@ -828,21 +830,12 @@ def _wrap_with_indent(text: str, line_w: int, indent: int) -> str:
     return ("\n" + pad).join(lines)
 
 
-# ── Panel toggle widget ───────────────────────────────────────────────────────
-
-class PanelToggle(Static):
-    """Clickable header bar that collapses/expands the map+telemetry panel."""
-
-    def on_click(self) -> None:
-        self.app.action_toggle_panels()
-
-
 # ── Init overlay ─────────────────────────────────────────────────────────────
 
 class InitOverlay(Static):
     """Full-screen splash shown while the app boots, with a cycling dot animation."""
 
-    _dot_step: reactive = reactive(0)
+    _dot_step = reactive(0)
 
     def on_mount(self) -> None:
         self.set_interval(0.4, self._tick)
@@ -896,7 +889,6 @@ class MeshLoungeApp(App):
         self._node_colors: Dict[str, str] = {}
         self._color_idx: int = 0
         self._selected_node: Optional[str] = None
-        self._start_time = time.time()
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
@@ -998,30 +990,33 @@ class MeshLoungeApp(App):
         feed.write(line)
 
     def _save_message_to_history(self, msg: MeshMessage) -> None:
-        try:
-            records: list = []
-            if HISTORY_FILE.exists():
-                try:
-                    records = json.loads(HISTORY_FILE.read_text())
-                except Exception:
-                    records = []
-            records.append({
-                "timestamp": msg.timestamp,
-                "sender_id": msg.sender_id,
-                "sender_name": msg.sender_name,
-                "text": msg.text,
-                "channel": msg.channel,
-                "is_dm": msg.is_dm,
-                "is_system": msg.is_system,
-                "snr": msg.snr,
-                "rssi": msg.rssi,
-                "hops": msg.hops,
-            })
-            if len(records) > HISTORY_MAX_STORED:
-                records = records[-HISTORY_MAX_STORED:]
-            HISTORY_FILE.write_text(json.dumps(records))
-        except Exception:
-            pass
+        # Run in a thread so file I/O doesn't block the UI event loop
+        def _write():
+            try:
+                records: list = []
+                if HISTORY_FILE.exists():
+                    try:
+                        records = json.loads(HISTORY_FILE.read_text())
+                    except Exception:
+                        records = []
+                records.append({
+                    "timestamp": msg.timestamp,
+                    "sender_id": msg.sender_id,
+                    "sender_name": msg.sender_name,
+                    "text": msg.text,
+                    "channel": msg.channel,
+                    "is_dm": msg.is_dm,
+                    "is_system": msg.is_system,
+                    "snr": msg.snr,
+                    "rssi": msg.rssi,
+                    "hops": msg.hops,
+                })
+                if len(records) > HISTORY_MAX_STORED:
+                    records = records[-HISTORY_MAX_STORED:]
+                HISTORY_FILE.write_text(json.dumps(records))
+            except Exception:
+                pass
+        self.run_worker(_write, thread=True)
 
     def _load_message_history(self) -> None:
         if not HISTORY_FILE.exists():
@@ -1295,13 +1290,13 @@ class MeshLoungeApp(App):
             pub.subscribe(self._on_connected, "meshtastic.connection.established")
             pub.subscribe(self._on_lost, "meshtastic.connection.lost")
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             if self._ble is not None:
                 if not BLE_AVAILABLE:
                     self._sys("[red]BLE not available — run: pip install bleak[/red]")
                     raise RuntimeError("bleak not installed")
-                target = self._ble or None  # None = auto-discover first device
+                target = self._ble if self._ble else None  # empty string = auto-discover
                 label = self._ble if self._ble else "auto-discover"
                 self._sys(f"connecting via BLE ([cyan]{label}[/cyan])...")
                 self._sys("  [dim]make sure Bluetooth is on and node is nearby[/dim]")
@@ -1370,7 +1365,8 @@ class MeshLoungeApp(App):
                 if primary:
                     fhz = getattr(primary, "frequency", None) or \
                           getattr(getattr(primary, "settings", None), "channel_num", None)
-                    if fhz and fhz > 100:
+                    # Field is in Hz when > 1 MHz; values <= 100 are likely unset/zero
+                    if fhz and fhz > 1_000_000:
                         freq_mhz = fhz / 1e6
                         parts.append(f"[cyan]{freq_mhz:.3f} MHz[/cyan]")
 
@@ -1386,6 +1382,25 @@ class MeshLoungeApp(App):
             header.freq_info = label
         except Exception:
             pass  # radio config is informational only
+
+    @staticmethod
+    def _get_my_node_num(interface) -> Optional[int]:
+        """Return this device's node number from whichever API version is present."""
+        my_info = getattr(interface, "myInfo", None)
+        if my_info:
+            num = getattr(my_info, "my_node_num", None) or getattr(my_info, "myNodeNum", None)
+            if num:
+                return num
+        local_node = getattr(interface, "localNode", None)
+        if local_node:
+            return getattr(local_node, "nodeNum", None)
+        return None
+
+    def _ensure_node(self, from_id: str) -> None:
+        """Create a placeholder node entry if we haven't seen this ID before."""
+        if from_id not in self.nodes:
+            self.nodes[from_id] = MeshNode(node_id=from_id)
+            self._assign_color(from_id)
 
     def _on_lost(self, interface, topic=pub.AUTO_TOPIC) -> None:
         def update():
@@ -1407,15 +1422,7 @@ class MeshLoungeApp(App):
 
             self._sys(f"device nodeDB: [cyan]{len(nodes_raw)}[/cyan] entries")
 
-            # Support both myInfo.my_node_num (older) and localNode.nodeNum (newer)
-            my_num = None
-            my_info = getattr(interface, "myInfo", None)
-            if my_info:
-                my_num = getattr(my_info, "my_node_num", None) or getattr(my_info, "myNodeNum", None)
-            if not my_num:
-                local_node = getattr(interface, "localNode", None)
-                if local_node:
-                    my_num = getattr(local_node, "nodeNum", None)
+            my_num = self._get_my_node_num(interface)
 
             # Read device metadata (firmware, hardware model) for my node
             meta = getattr(interface, "metadata", None)
@@ -1459,14 +1466,7 @@ class MeshLoungeApp(App):
                 nodes_raw = {f"!{num:08x}": data for num, data in nodes_by_num.items()}
 
             added = 0
-            my_num = None
-            my_info = getattr(interface, "myInfo", None)
-            if my_info:
-                my_num = getattr(my_info, "my_node_num", None) or getattr(my_info, "myNodeNum", None)
-            if not my_num:
-                local_node = getattr(interface, "localNode", None)
-                if local_node:
-                    my_num = getattr(local_node, "nodeNum", None)
+            my_num = self._get_my_node_num(interface)
 
             for nid, data in nodes_raw.items():
                 if nid not in self.nodes:
@@ -1498,11 +1498,11 @@ class MeshLoungeApp(App):
             short_name=user.get("shortName", "????"),
             latitude=lat,
             longitude=lon,
-            altitude=pos.get("altitude") or None,
+            altitude=pos.get("altitude") if pos.get("altitude") is not None else None,
             battery_level=metrics.get("batteryLevel") or None,
             voltage=metrics.get("voltage") or None,
             rssi=data.get("rssi") or None,
-            snr=data.get("snr") or None,
+            snr=data.get("snr") if data.get("snr") is not None else None,
             last_heard=last_heard,
             hops_away=data.get("hopsAway", 0),
             air_util_tx=metrics.get("airUtilTx") or None,
@@ -1531,14 +1531,14 @@ class MeshLoungeApp(App):
         to_id = f"!{packet.get('to', 0xFFFFFFFF):08x}"
         text = decoded.get("text", "")
         channel = packet.get("channel", 0)
-        node = self.nodes.get(from_id)
+        snr = packet.get("rxSnr")
+        rssi = packet.get("rxRssi")
 
-        if from_id not in self.nodes:
-            self.nodes[from_id] = MeshNode(node_id=from_id)
-            self._assign_color(from_id)
-        self.nodes[from_id].last_heard = time.time()
-        self.nodes[from_id].snr = packet.get("rxSnr")
-        self.nodes[from_id].rssi = packet.get("rxRssi")
+        self._ensure_node(from_id)
+        node = self.nodes[from_id]
+        node.last_heard = time.time()
+        node.snr = snr
+        node.rssi = rssi
 
         hops = packet.get("hopStart", 0) - packet.get("hopLimit", 0)
         # Use rxTime (when the device received it) rather than wall-clock now
@@ -1546,21 +1546,19 @@ class MeshLoungeApp(App):
         self._add_message(MeshMessage(
             timestamp=rx_time,
             sender_id=from_id,
-            sender_name=node.short_name if node else from_id[-4:],
+            sender_name=node.short_name,
             text=text,
             channel=channel,
             is_dm=(to_id != "!ffffffff"),
-            snr=packet.get("rxSnr"),
-            rssi=packet.get("rxRssi"),
+            snr=snr,
+            rssi=rssi,
             hops=max(0, hops),
         ))
 
     def _rx_telemetry(self, packet: dict, decoded: dict) -> None:
         from_id = f"!{packet.get('from', 0):08x}"
         metrics = decoded.get("telemetry", {}).get("deviceMetrics", {})
-        if from_id not in self.nodes:
-            self.nodes[from_id] = MeshNode(node_id=from_id)
-            self._assign_color(from_id)
+        self._ensure_node(from_id)
         n = self.nodes[from_id]
         if "batteryLevel" in metrics:
             n.battery_level = metrics["batteryLevel"]
@@ -1575,9 +1573,7 @@ class MeshLoungeApp(App):
     def _rx_position(self, packet: dict, decoded: dict) -> None:
         from_id = f"!{packet.get('from', 0):08x}"
         pos = decoded.get("position", {})
-        if from_id not in self.nodes:
-            self.nodes[from_id] = MeshNode(node_id=from_id)
-            self._assign_color(from_id)
+        self._ensure_node(from_id)
         n = self.nodes[from_id]
         if "latitude" in pos:
             n.latitude = pos["latitude"]
@@ -1590,9 +1586,7 @@ class MeshLoungeApp(App):
     def _rx_nodeinfo(self, packet: dict, decoded: dict) -> None:
         from_id = f"!{packet.get('from', 0):08x}"
         user = decoded.get("user", {})
-        if from_id not in self.nodes:
-            self.nodes[from_id] = MeshNode(node_id=from_id)
-            self._assign_color(from_id)
+        self._ensure_node(from_id)
         n = self.nodes[from_id]
         n.long_name = user.get("longName", n.long_name)
         n.short_name = user.get("shortName", n.short_name)
@@ -1808,7 +1802,6 @@ def main():
     args = parser.parse_args()
 
     app = MeshLoungeApp(port=args.port, host=args.host, baud=args.baud, ble=args.ble)
-    import subprocess, os
     try:
         app.run()
     except (KeyboardInterrupt, SystemExit):
