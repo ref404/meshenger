@@ -1,0 +1,4 @@
+textual>=0.52.0
+meshtastic>=2.3.0
+pypubsub>=4.0.3
+bleak>=0.21.0
