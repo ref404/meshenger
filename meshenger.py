@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import json
 import math
+from collections import deque
 import os
 import random
 import re
@@ -55,6 +56,18 @@ try:
 except ImportError:
     BLE_AVAILABLE = False
 
+# ── Terminal compat shim ────────────────────────────────────────────────────
+# Apple Terminal.app can't parse Textual's in-band window-resize probe
+# (CSI ? 2048 $ p) and echoes a stray "p" in the top-left cell at startup.
+# Neutralize the probe there; Textual falls back to SIGWINCH for resize, which
+# Terminal.app handles fine, so nothing is lost.
+if os.environ.get("TERM_PROGRAM") == "Apple_Terminal":
+    try:
+        from textual.drivers.linux_driver import LinuxDriver
+        LinuxDriver._query_in_band_window_resize = lambda self: None
+    except Exception:
+        pass
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 VERSION = "1.0.0"
@@ -67,11 +80,12 @@ CHANNEL_NAMES = [
     "MedFast", "ShortSlow", "ShortFast", "ShortTurbo",
 ]
 
+# Muted, desaturated name colors — distinct hues that sit calmly on the dark theme.
 NODE_COLORS = [
-    "cyan", "magenta", "yellow", "bright_green",
-    "bright_blue", "bright_red", "bright_cyan", "bright_magenta",
-    "orange3", "deep_pink1", "green3", "sky_blue1",
-    "chartreuse3", "hot_pink", "medium_spring_green", "cornflower_blue",
+    "#9ab87f", "#7fb0a6", "#c2a86a", "#b08fb0",
+    "#8aa4c2", "#c28f8f", "#9fb0c8", "#c2a0c2",
+    "#bfa37a", "#cf9aa6", "#a6c28f", "#8fbfc2",
+    "#b6c28f", "#c89fb4", "#8fc2a8", "#a4b0d0",
 ]
 
 DEMO_NODES = [
@@ -165,7 +179,7 @@ class MeshNode:
         lvl = self.battery_level
         blocks = round(lvl / 20)
         bar = "█" * blocks + "░" * (5 - blocks)
-        color = "bright_green" if lvl > 60 else "yellow" if lvl > 25 else "red"
+        color = "#a7c189" if lvl > 60 else "yellow" if lvl > 25 else "red"
         t.append(bar, style=color)
         t.append(f" {lvl}%", style=color)
         return t
@@ -177,9 +191,9 @@ class MeshNode:
             return t
         snr = self.snr
         if snr >= 5:
-            bars, color = "▁▃▅▇", "bright_green"
+            bars, color = "▁▃▅▇", "#a7c189"
         elif snr >= 0:
-            bars, color = "▁▃▅░", "green"
+            bars, color = "▁▃▅░", "#8ba672"
         elif snr >= -5:
             bars, color = "▁▃░░", "yellow"
         elif snr >= -10:
@@ -192,7 +206,7 @@ class MeshNode:
 
     def hops_text(self) -> Text:
         t = Text()
-        color = "bright_green" if self.hops_away == 0 else "yellow" if self.hops_away <= 2 else "orange3"
+        color = "#a7c189" if self.hops_away == 0 else "yellow" if self.hops_away <= 2 else "orange3"
         hop_sym = "⬤ " * (min(self.hops_away, 4) + 1)
         t.append(f"{self.hops_away} ", style=color)
         t.append(hop_sym, style=f"dim {color}")
@@ -227,59 +241,94 @@ class HeaderBar(Static):
     node_count = reactive(0)
     channel_name = reactive("LongFast")
     freq_info = reactive("")
+    packets_per_min = reactive(0)
+    channel_util = reactive(None)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._start = time.time()
 
+    @staticmethod
+    def _vu_bar(pct: Optional[float], width: int = 10) -> Tuple[str, str]:
+        """Return (bar, color) for a 0-100% utilization gauge."""
+        if pct is None:
+            return "─" * width, "dim #8ba672"
+        pct = max(0.0, min(100.0, pct))
+        fill = round(pct / 100 * width)
+        color = "#a7c189" if pct < 25 else "yellow" if pct < 50 else "red"
+        return "▰" * fill + "▱" * (width - fill), color
+
     def render(self) -> Text:
         t = Text()
-        t.append(self.LOGO, style="bold bright_green")
+        t.append(self.LOGO, style="bold #a7c189")
         t.append("\n")
         elapsed = int(time.time() - self._start)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
         uptime = f"{h:02d}:{m:02d}:{s:02d}"
         ts = datetime.now().strftime("%H:%M:%S")
 
-        sep = Text("  │  ", style="dim green")
+        sep = Text("  │  ", style="dim #8ba672")
 
         # Status row
         t.append("  ")
         if "LIVE" in self.connection_status:
-            t.append(f" {self.connection_status} ", style="bold bright_green on #001a00")
+            t.append(f" {self.connection_status} ", style="bold #a7c189 on #1a2618")
         elif "DEMO" in self.connection_status:
-            t.append(f" {self.connection_status} ", style="bold yellow on #1a1500")
+            t.append(f" {self.connection_status} ", style="bold yellow on #262013")
         else:
-            t.append(f" {self.connection_status} ", style="bold red on #1a0000")
+            t.append(f" {self.connection_status} ", style="bold red on #261515")
         t.append_text(sep)
-        t.append("CH:", style="dim green")
-        t.append(f" {self.channel_name}", style="bold cyan")
+        t.append("CH:", style="dim #8ba672")
+        t.append(f" {self.channel_name}", style="bold #7ba9a0")
         t.append_text(sep)
-        t.append("NODES:", style="dim green")
-        t.append(f" {self.node_count}", style="bold bright_green")
+        t.append("NODES:", style="dim #8ba672")
+        t.append(f" {self.node_count}", style="bold #a7c189")
         t.append_text(sep)
-        t.append("UPTIME:", style="dim green")
-        t.append(f" {uptime}", style="bold green")
+        t.append("PKT/M:", style="dim #8ba672")
+        t.append(f" {self.packets_per_min}", style="bold #a7c189")
         t.append_text(sep)
-        t.append("UTC:", style="dim green")
-        t.append(f" {ts}", style="bold green")
+        t.append("UPTIME:", style="dim #8ba672")
+        t.append(f" {uptime}", style="bold #8ba672")
+        t.append_text(sep)
+        t.append("UTC:", style="dim #8ba672")
+        t.append(f" {ts}", style="bold #8ba672")
         t.append("\n")
 
-        # Frequency + hints row
+        # Frequency + channel-util gauge + hints row
         t.append("  ")
-        t.append("FREQ:", style="dim green")
-        t.append(f" {self.freq_info if self.freq_info else '—'}", style="bold cyan")
+        t.append("FREQ:", style="dim #8ba672")
+        t.append(f" {self.freq_info if self.freq_info else '—'}", style="bold #7ba9a0")
         t.append_text(sep)
-        t.append("/help  /dm  /channel  /nodes  /info  /select  /clear  "
-                 "[ctrl+t map]  [ctrl+r refresh]", style="dim")
+        t.append("CHUTIL ", style="dim #8ba672")
+        bar, bar_color = self._vu_bar(self.channel_util)
+        t.append(bar, style=bar_color)
+        util_txt = f" {self.channel_util:.0f}%" if self.channel_util is not None else " —"
+        t.append(util_txt, style=f"bold {bar_color}")
+        t.append_text(sep)
+        t.append("/help  [^t map]  [^g view]  [^l links]", style="dim")
 
         return t
 
 
 class NodeListPanel(Static):
-    """Scrollable node list with signal/battery/hops."""
+    """Scrollable node list with signal/battery/hops. Focusable for j/k nav."""
+
+    can_focus = True
+
+    BINDINGS = [
+        Binding("down,j", "cursor(1)", "Down", show=False),
+        Binding("up,k",   "cursor(-1)", "Up", show=False),
+        Binding("enter",  "activate", "DM", show=False),
+        Binding("escape", "leave", "Back", show=False),
+    ]
 
     class NodeSelected(Message):
+        def __init__(self, node_id: str) -> None:
+            super().__init__()
+            self.node_id = node_id
+
+    class NodeActivated(Message):
+        """User pressed enter on a node — open a DM to it."""
         def __init__(self, node_id: str) -> None:
             super().__init__()
             self.node_id = node_id
@@ -296,6 +345,12 @@ class NodeListPanel(Static):
         w = self.size.width
         return strip.crop(0, w).extend_cell_length(w)
 
+    def _sorted(self) -> List[MeshNode]:
+        return sorted(
+            self._mesh_nodes.values(),
+            key=lambda n: (not n.is_mine, not n.is_online, n.long_name.lower()),
+        )
+
     def update_nodes(self, nodes: Dict[str, MeshNode], node_colors: Dict[str, str],
                      selected: Optional[str] = None):
         self._mesh_nodes = nodes
@@ -306,12 +361,46 @@ class NodeListPanel(Static):
     def on_resize(self, event) -> None:
         self.refresh(layout=True)
 
+    def on_focus(self) -> None:
+        self.refresh()
+
+    def on_blur(self) -> None:
+        self.refresh()
+
     def on_click(self, event) -> None:
+        self.focus()
         y = event.y
         for start, end, node_id in self._node_line_map:
             if start <= y < end:
                 self.post_message(NodeListPanel.NodeSelected(node_id))
                 break
+
+    def line_of(self, node_id: str) -> Optional[int]:
+        for start, _end, nid in self._node_line_map:
+            if nid == node_id:
+                return start
+        return None
+
+    def action_cursor(self, delta: int) -> None:
+        order = [n.node_id for n in self._sorted()]
+        if not order:
+            return
+        if self._selected_node_id in order:
+            idx = order.index(self._selected_node_id)
+            idx = max(0, min(len(order) - 1, idx + delta))
+        else:
+            idx = 0
+        self.post_message(NodeListPanel.NodeSelected(order[idx]))
+
+    def action_activate(self) -> None:
+        if self._selected_node_id:
+            self.post_message(NodeListPanel.NodeActivated(self._selected_node_id))
+
+    def action_leave(self) -> None:
+        try:
+            self.app.query_one("#chat-input").focus()
+        except Exception:
+            pass
 
     def render(self) -> Text:
         t = Text()
@@ -324,9 +413,13 @@ class NodeListPanel(Static):
         content_w = max(4, self.size.width - 2)
         sep_w = content_w  # separator exactly fills content width — never wraps
 
-        t.append("◈ NODES ", style="bold bright_green")
-        t.append(f"[{online} online / {total} total]\n", style="dim green")
-        t.append("━" * sep_w + "\n", style="dim green")
+        t.append("◈ NODES ", style="bold #a7c189")
+        t.append(f"[{online} online / {total} total]\n", style="dim #8ba672")
+        if self.has_focus:
+            t.append("  ↑↓/jk move · ⏎ dm · esc\n", style="#7ba9a0")
+        else:
+            t.append("  tab to navigate ›\n", style="dim #8ba672")
+        t.append("━" * sep_w + "\n", style="dim #8ba672")
 
         # visual_offset: extra visual rows the header line adds beyond its one logical \n
         # (wrapping only; separator is exactly sep_w so it never wraps)
@@ -335,30 +428,25 @@ class NodeListPanel(Static):
         visual_offset = header_visual_rows - 1
 
         if not self._mesh_nodes:
-            t.append("\n   scanning for nodes...\n", style="dim green")
-            t.append("   ▒▒▒░░░░░░░░░░░░░░░░\n", style="dim green")
+            t.append("\n   scanning for nodes...\n", style="dim #8ba672")
+            t.append("   ▒▒▒░░░░░░░░░░░░░░░░\n", style="dim #8ba672")
             return t
 
-        sorted_nodes = sorted(
-            self._mesh_nodes.values(),
-            key=lambda n: (not n.is_mine, not n.is_online, n.long_name.lower()),
-        )
-
-        for node in sorted_nodes:
+        for node in self._sorted():
             color = self._node_colors.get(node.node_id, "white")
             is_selected = node.node_id == self._selected_node_id
-            bg = " on #001a00" if is_selected else ""
+            bg = " on #1a2618" if is_selected else ""
 
             start_line = t.plain.count('\n') + visual_offset
 
             # Status dot + name
             if node.is_mine:
-                t.append("◉ ", style=f"bold bright_green{bg}")
+                t.append("◉ ", style=f"bold #a7c189{bg}")
                 name = node.long_name[:16]
                 t.append(f"{name}", style=f"bold {color}{bg}")
-                t.append(" ◂you\n", style=f"dim bright_green{bg}")
+                t.append(" ◂you\n", style=f"dim #a7c189{bg}")
             elif node.is_online:
-                t.append("● ", style=f"bright_green{bg}")
+                t.append("● ", style=f"#a7c189{bg}")
                 t.append(f"{node.long_name[:16]}\n", style=f"{color}{bg}")
             else:
                 t.append("○ ", style=f"dim{bg}")
@@ -366,8 +454,8 @@ class NodeListPanel(Static):
 
             # Node ID
             short_id = node.node_id.lstrip("!")[-8:]
-            t.append(f"  !{short_id}", style="dim green")
-            t.append(f"  [{node.short_name}]\n", style="dim cyan")
+            t.append(f"  !{short_id}", style="dim #8ba672")
+            t.append(f"  [{node.short_name}]\n", style="dim #7ba9a0")
 
             # Signal
             t.append("  sig ", style="dim")
@@ -394,12 +482,12 @@ class NodeListPanel(Static):
                         seen = f"{int(elapsed / 60)}m ago"
                     else:
                         seen = f"{int(elapsed / 3600)}h ago"
-                    color_seen = "dim green" if node.is_online else "dim red"
+                    color_seen = "dim #8ba672" if node.is_online else "dim red"
                     t.append(f"  seen {seen}\n", style=color_seen)
 
             # GPS indicator
             if node.latitude is not None:
-                t.append("  ⌖ GPS\n", style="dim cyan")
+                t.append("  ⌖ GPS\n", style="dim #7ba9a0")
 
             t.append("╌" * sep_w + "\n", style="dim")
 
@@ -423,73 +511,242 @@ class MapPanel(Static):
     def MAP_H(self) -> int:
         return self._MAP_H_DEFAULT
 
+    _PULSE_SECS = 1.6          # how long a node "blooms" after a packet
+    _PULSE_GLYPHS = "❖✦✸✦"     # bloom animation frames
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._mesh_nodes: Dict[str, MeshNode] = {}
         self._node_colors: Dict[str, str] = {}
+        self._pulse: Dict[str, float] = {}   # node_id -> last packet time
         self._blink = True
         self._frame = 0
+        self._show_links = False             # ctrl+l toggles mesh link lines
+        self._mode = "gps"                   # "gps" grid, or "hops" topology rings
+        self._trace: List[str] = []          # ordered node_ids of an active traceroute
+        self._trace_frame = 0                # animation clock for the trace comet
 
     def on_resize(self, event) -> None:
         self.refresh(layout=True)
 
-    def update_nodes(self, nodes: Dict[str, MeshNode], node_colors: Dict[str, str]):
+    def update_nodes(self, nodes: Dict[str, MeshNode], node_colors: Dict[str, str],
+                     pulse: Optional[Dict[str, float]] = None):
         self._mesh_nodes = nodes
         self._node_colors = node_colors
+        if pulse is not None:
+            self._pulse = pulse
+        self.refresh(layout=True)
+
+    def toggle_links(self) -> bool:
+        self._show_links = not self._show_links
+        self.refresh(layout=True)
+        return self._show_links
+
+    def toggle_mode(self) -> str:
+        self._mode = "hops" if self._mode == "gps" else "gps"
+        self.refresh(layout=True)
+        return self._mode
+
+    def set_trace(self, route: List[str]) -> None:
+        self._trace = list(route)
+        self._trace_frame = 0
         self.refresh(layout=True)
 
     def tick(self):
         self._blink = not self._blink
         self._frame += 1
+        if self._trace:
+            self._trace_frame += 1
+            if self._trace_frame > 48:   # comet has run its course — clear it
+                self._trace = []
         self.refresh()
 
-    def _compute_grid(self) -> Tuple[List[List[str]], List[List[Optional[str]]]]:
-        grid = [[" "] * self.MAP_W for _ in range(self.MAP_H)]
-        colors = [[None] * self.MAP_W for _ in range(self.MAP_H)]
+    # ── geometry helpers ──────────────────────────────────────────────────────
+
+    def _blank_cells(self) -> List[List[Tuple[str, str]]]:
+        return [[(" ", "")] * self.MAP_W for _ in range(self.MAP_H)]
+
+    def _node_glyph(self, node: MeshNode, now: float) -> Tuple[str, str]:
+        """Return (char, style) for a node, blooming if it transmitted recently."""
+        color = self._node_colors.get(node.node_id) or "#8ba672"
+        if (now - self._pulse.get(node.node_id, 0.0)) < self._PULSE_SECS:
+            glyph = self._PULSE_GLYPHS[self._frame % len(self._PULSE_GLYPHS)]
+            return glyph, f"bold {color}"
+        if node.is_mine:
+            return ("◉" if self._blink else "○"), f"bold {color}"
+        if node.is_online:
+            return "◆", f"bold {color}"
+        return "◇", "dim"
+
+    @staticmethod
+    def _line_cells(x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
+        """Bresenham line between two grid cells."""
+        out = []
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        while True:
+            out.append((x0, y0))
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x0 += sx
+            if e2 <= dx:
+                err += dx
+                y0 += sy
+        return out
+
+    def _compute_gps(self) -> Tuple[List[List[Tuple[str, str]]], dict]:
+        """GPS grid: nodes plotted by lat/lon, with range rings around 'you'."""
+        cells = self._blank_cells()
+        W, H = self.MAP_W, self.MAP_H
+        now = time.time()
 
         # Sparse reference dots at every 8 cols × 4 rows
-        for ry in range(0, self.MAP_H, 4):
-            for rx in range(0, self.MAP_W, 8):
-                grid[ry][rx] = "·"
+        for ry in range(0, H, 4):
+            for rx in range(0, W, 8):
+                cells[ry][rx] = ("·", "dim")
 
         nodes_gps = [n for n in self._mesh_nodes.values() if n.latitude is not None]
         if not nodes_gps:
-            return grid, colors
+            return cells, {"rings": [], "span_km": None}
 
         lats = [n.latitude for n in nodes_gps]
         lons = [n.longitude for n in nodes_gps]
         min_lat, max_lat = min(lats), max(lats)
         min_lon, max_lon = min(lons), max(lons)
-
         lat_span = max(max_lat - min_lat, 0.005)
         lon_span = max(max_lon - min_lon, 0.005)
-
-        pad_lat = lat_span * 0.18
-        pad_lon = lon_span * 0.18
-        min_lat -= pad_lat
-        max_lat += pad_lat
-        min_lon -= pad_lon
-        max_lon += pad_lon
+        pad_lat, pad_lon = lat_span * 0.18, lon_span * 0.18
+        min_lat -= pad_lat; max_lat += pad_lat
+        min_lon -= pad_lon; max_lon += pad_lon
         lat_span = max_lat - min_lat
         lon_span = max_lon - min_lon
 
-        for node in nodes_gps:
-            px = int((node.longitude - min_lon) / lon_span * (self.MAP_W - 1))
-            py = int((1 - (node.latitude - min_lat) / lat_span) * (self.MAP_H - 1))
-            px = max(0, min(self.MAP_W - 1, px))
-            py = max(0, min(self.MAP_H - 1, py))
+        klat = 111.0
+        klon = 111.0 * math.cos(math.radians((min_lat + max_lat) / 2))
 
-            if node.is_mine:
-                sym = "◉" if self._blink else "○"
-            elif node.is_online:
-                sym = "◆"
-            else:
-                sym = "◇"
+        def to_cell(lat, lon):
+            px = int((lon - min_lon) / lon_span * (W - 1))
+            py = int((1 - (lat - min_lat) / lat_span) * (H - 1))
+            return max(0, min(W - 1, px)), max(0, min(H - 1, py))
 
-            grid[py][px] = sym
-            colors[py][px] = self._node_colors.get(node.node_id)
+        def cell_geo(px, py):
+            lon = min_lon + px / (W - 1) * lon_span
+            lat = min_lat + (1 - py / (H - 1)) * lat_span
+            return lat, lon
 
-        return grid, colors
+        mine = next((n for n in nodes_gps if n.is_mine), None)
+        rings: List[float] = []
+        if mine is not None:
+            mlat, mlon = mine.latitude, mine.longitude
+
+            def km(lat, lon):
+                return math.hypot((lat - mlat) * klat, (lon - mlon) * klon)
+
+            far = max((km(n.latitude, n.longitude) for n in nodes_gps), default=0.0)
+            if far > 0.02:
+                step = far / 3.0
+                rings = [step, 2 * step, 3 * step]
+                tol = step * 0.16
+                for py in range(H):
+                    for px in range(W):
+                        if cells[py][px][0] not in (" ", "·"):
+                            continue
+                        d = km(*cell_geo(px, py))
+                        if any(abs(d - r) < tol for r in rings):
+                            cells[py][px] = ("∘", "dim #2c3a2c")
+
+        # Mesh link lines (you → each node), drawn under the node glyphs
+        if self._show_links and mine is not None:
+            mx, my = to_cell(mine.latitude, mine.longitude)
+            for n in nodes_gps:
+                if n.is_mine:
+                    continue
+                nx, ny = to_cell(n.latitude, n.longitude)
+                for lx, ly in self._line_cells(mx, my, nx, ny):
+                    if cells[ly][lx][0] in (" ", "·", "∘"):
+                        cells[ly][lx] = ("∙", "dim #3a4d36")
+
+        for n in nodes_gps:
+            px, py = to_cell(n.latitude, n.longitude)
+            cells[py][px] = self._node_glyph(n, now)
+
+        # Traceroute comet: reveal the path hop-by-hop with a bright travelling head
+        if self._trace:
+            pos = {n.node_id: to_cell(n.latitude, n.longitude) for n in nodes_gps}
+            pts = [pos[nid] for nid in self._trace if nid in pos]
+            path: List[Tuple[int, int]] = []
+            for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+                seg = self._line_cells(ax, ay, bx, by)
+                if path and seg and seg[0] == path[-1]:
+                    seg = seg[1:]
+                path.extend(seg)
+            if len(path) >= 2:
+                head = min(len(path) - 1, self._trace_frame * 2)
+                for i, (cx, cy) in enumerate(path):
+                    if i > head:
+                        break
+                    if i == head:
+                        cells[cy][cx] = ("◉", "bold #d7ffd0")
+                    elif cells[cy][cx][0] in (" ", "·", "∘", "∙"):
+                        cells[cy][cx] = ("•", "#a7c189")
+
+        span_km = None
+        if len(nodes_gps) >= 2:
+            span_km = math.hypot((max(lats) - min(lats)) * klat,
+                                 (max(lons) - min(lons)) * klon)
+        return cells, {"rings": rings, "span_km": span_km}
+
+    def _compute_hops(self) -> Tuple[List[List[Tuple[str, str]]], dict]:
+        """Topology view: 'you' at center, nodes on concentric rings by hop count."""
+        cells = self._blank_cells()
+        W, H = self.MAP_W, self.MAP_H
+        now = time.time()
+        cx, cy = W // 2, H // 2
+
+        nodes = list(self._mesh_nodes.values())
+        mine = next((n for n in nodes if n.is_mine), None)
+        others = [n for n in nodes if not n.is_mine]
+        max_hop = max((max(1, n.hops_away) for n in others), default=1)
+        rmax = min(cx - 1, (cy - 1) * 2)
+
+        def ring_radii(h):
+            rx = rmax * h / max_hop
+            return rx, rx * 0.5
+
+        # Concentric hop rings
+        for h in range(1, max_hop + 1):
+            rx, ry = ring_radii(h)
+            steps = max(28, int(rx * 5))
+            for s in range(steps):
+                ang = 2 * math.pi * s / steps
+                px = int(round(cx + rx * math.cos(ang)))
+                py = int(round(cy + ry * math.sin(ang)))
+                if 0 <= px < W and 0 <= py < H and cells[py][px][0] == " ":
+                    cells[py][px] = ("·", "dim #2c3a2c")
+
+        byhop: Dict[int, List[MeshNode]] = {}
+        for n in others:
+            byhop.setdefault(max(1, n.hops_away), []).append(n)
+
+        for h, group in byhop.items():
+            rx, ry = ring_radii(h)
+            for i, n in enumerate(group):
+                ang = 2 * math.pi * i / len(group) + h * 0.7
+                px = max(0, min(W - 1, int(round(cx + rx * math.cos(ang)))))
+                py = max(0, min(H - 1, int(round(cy + ry * math.sin(ang)))))
+                if self._show_links:
+                    for lx, ly in self._line_cells(cx, cy, px, py):
+                        if cells[ly][lx][0] in (" ", "·"):
+                            cells[ly][lx] = ("∙", "dim #3a4d36")
+                cells[py][px] = self._node_glyph(n, now)
+
+        cells[cy][cx] = self._node_glyph(mine, now) if mine else ("◎", "dim #8ba672")
+        return cells, {"max_hop": max_hop}
 
     def _border_top(self) -> Tuple[str, str, str]:
         """Return (left_dashes, marker, right_dashes) for top/bottom border."""
@@ -504,91 +761,97 @@ class MapPanel(Static):
         right = "─" * (self.MAP_W - len(marker) - len(left))
         return left, marker, right
 
-    def render(self) -> Text:
-        t = Text()
-        nodes_gps = [n for n in self._mesh_nodes.values() if n.latitude is not None]
-        count = len(nodes_gps)
-
-        t.append("◈ GRID MAP", style="bold bright_green")
-        if count:
-            t.append(f" ── {count} node{'s' if count != 1 else ''}", style="dim green")
-        t.append("\n")
-        t.append("━" * (self.MAP_W + 2) + "\n", style="dim green")
-
+    def _draw_cells(self, t: Text, cells: List[List[Tuple[str, str]]]) -> None:
         tl, tm, tr = self._border_top()
         bl, bm, br = self._border_bot()
+        t.append("┌" + tl, style="dim #8ba672")
+        t.append(tm, style="dim #7ba9a0")
+        t.append(tr + "┐\n", style="dim #8ba672")
+        mid_row = self.MAP_H // 2
+        for row_i, row in enumerate(cells):
+            edge_style = "dim #7ba9a0" if row_i == mid_row else "dim #8ba672"
+            t.append("W" if row_i == mid_row else "│", style=edge_style)
+            for ch, st in row:
+                t.append(ch, style=st)
+            t.append("E\n" if row_i == mid_row else "│\n", style=edge_style)
+        t.append("└" + bl, style="dim #8ba672")
+        t.append(bm, style="dim #7ba9a0")
+        t.append(br + "┘\n", style="dim #8ba672")
 
-        if not nodes_gps:
-            t.append("┌" + tl, style="dim green")
-            t.append(tm, style="dim cyan")
-            t.append(tr + "┐\n", style="dim green")
-            mid = self.MAP_H // 2
-            for i in range(self.MAP_H):
-                t.append("│", style="dim green")
-                if i == mid - 1:
-                    msg = "awaiting gps fix"
-                    pad = self.MAP_W - len(msg)
-                    t.append(" " * (pad // 2) + msg + " " * (pad - pad // 2), style="dim green")
-                elif i == mid:
-                    spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[self._frame % 10]
-                    msg = f"{spin} scanning"
-                    pad = self.MAP_W - len(msg)
-                    t.append(" " * (pad // 2) + msg + " " * (pad - pad // 2), style="dim green")
-                else:
-                    t.append(" " * self.MAP_W)
-                t.append("│\n", style="dim green")
-            t.append("└" + bl, style="dim green")
-            t.append(bm, style="dim cyan")
-            t.append(br + "┘\n", style="dim green")
+    def _scanning_box(self, t: Text) -> None:
+        tl, tm, tr = self._border_top()
+        bl, bm, br = self._border_bot()
+        t.append("┌" + tl, style="dim #8ba672")
+        t.append(tm, style="dim #7ba9a0")
+        t.append(tr + "┐\n", style="dim #8ba672")
+        mid = self.MAP_H // 2
+        for i in range(self.MAP_H):
+            t.append("│", style="dim #8ba672")
+            if i == mid - 1:
+                msg = "awaiting gps fix"
+            elif i == mid:
+                msg = f"{'⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'[self._frame % 10]} scanning"
+            else:
+                msg = None
+            if msg is None:
+                t.append(" " * self.MAP_W)
+            else:
+                pad = self.MAP_W - len(msg)
+                t.append(" " * (pad // 2) + msg + " " * (pad - pad // 2), style="dim #8ba672")
+            t.append("│\n", style="dim #8ba672")
+        t.append("└" + bl, style="dim #8ba672")
+        t.append(bm, style="dim #7ba9a0")
+        t.append(br + "┘\n", style="dim #8ba672")
+
+    def _draw_hints(self, t: Text) -> None:
+        mode_label = "topology" if self._mode == "hops" else "gps grid"
+        links_state = "on" if self._show_links else "off"
+        t.append(f"[^g] {mode_label}  [^l] links:{links_state}\n", style="dim #7ba9a0")
+
+    def render(self) -> Text:
+        t = Text()
+
+        if self._mode == "hops":
+            cells, meta = self._compute_hops()
+            mh = meta["max_hop"]
+            t.append("◈ MESH TOPOLOGY", style="bold #a7c189")
+            t.append(f" ── {mh} hop{'s' if mh != 1 else ''} out\n", style="dim #8ba672")
+            t.append("━" * (self.MAP_W + 2) + "\n", style="dim #8ba672")
+            self._draw_cells(t, cells)
+            t.append("◉ you  ◆ online  ◇ offline  ✦ tx\n", style="dim #8ba672")
+            self._draw_hints(t)
+            t.append("rings = hops from you\n", style="dim #8ba672")
             return t
 
-        grid, colors = self._compute_grid()
+        cells, meta = self._compute_gps()
+        nodes_gps = [n for n in self._mesh_nodes.values() if n.latitude is not None]
+        t.append("◈ GRID MAP", style="bold #a7c189")
+        if nodes_gps:
+            t.append(f" ── {len(nodes_gps)} node{'s' if len(nodes_gps) != 1 else ''}",
+                     style="dim #8ba672")
+        t.append("\n")
+        t.append("━" * (self.MAP_W + 2) + "\n", style="dim #8ba672")
 
-        t.append("┌" + tl, style="dim green")
-        t.append(tm, style="dim cyan")
-        t.append(tr + "┐\n", style="dim green")
-        mid_row = self.MAP_H // 2
-        for row_i, row in enumerate(grid):
-            if row_i == mid_row:
-                t.append("W", style="dim cyan")
-            else:
-                t.append("│", style="dim green")
-            for col_i, cell in enumerate(row):
-                c = colors[row_i][col_i]
-                if c:
-                    t.append(cell, style=f"bold {c}")
-                elif cell == "·":
-                    t.append(cell, style="dim")
-                else:
-                    t.append(cell)
-            if row_i == mid_row:
-                t.append("E\n", style="dim cyan")
-            else:
-                t.append("│\n", style="dim green")
-        t.append("└" + bl, style="dim green")
-        t.append(bm, style="dim cyan")
-        t.append(br + "┘\n", style="dim green")
+        if not nodes_gps:
+            self._scanning_box(t)
+            self._draw_hints(t)
+            return t
 
-        # Legend
-        t.append("◉ you  ◆ online  ◇ offline\n", style="dim green")
+        self._draw_cells(t, cells)
+        t.append("◉ you  ◆ online  ◇ offline  ✦ tx\n", style="dim #8ba672")
+        self._draw_hints(t)
 
-        # My coordinates
         mine = next((n for n in nodes_gps if n.is_mine), None)
         if mine:
-            t.append(f"LAT  {mine.latitude:>10.5f}°\n", style="dim cyan")
-            t.append(f"LON  {mine.longitude:>10.5f}°\n", style="dim cyan")
+            t.append(f"LAT  {mine.latitude:>10.5f}°\n", style="dim #7ba9a0")
+            t.append(f"LON  {mine.longitude:>10.5f}°\n", style="dim #7ba9a0")
             if mine.altitude is not None:
-                t.append(f"ALT  {mine.altitude:>8}m\n", style="dim cyan")
-
-        # Range estimate (rough)
-        if len(nodes_gps) >= 2:
-            lats = [n.latitude for n in nodes_gps]
-            lons = [n.longitude for n in nodes_gps]
-            lat_d = (max(lats) - min(lats)) * 111
-            lon_d = (max(lons) - min(lons)) * 85
-            span_km = math.sqrt(lat_d**2 + lon_d**2)
-            t.append(f"SPAN ≈ {span_km:.1f}km\n", style="dim green")
-
+                t.append(f"ALT  {mine.altitude:>8}m\n", style="dim #7ba9a0")
+        if meta["rings"]:
+            r = meta["rings"]
+            t.append(f"RING ≈ {r[0]:.1f}/{r[1]:.1f}/{r[2]:.1f}km\n", style="dim #7ba9a0")
+        if meta["span_km"]:
+            t.append(f"SPAN ≈ {meta['span_km']:.1f}km\n", style="dim #8ba672")
         return t
 
 
@@ -610,8 +873,8 @@ class TelemetryPanel(Static):
 
     def render(self) -> Text:
         t = Text()
-        t.append("◈ TELEMETRY\n", style="bold bright_green")
-        t.append("━" * 28 + "\n", style="dim green")
+        t.append("◈ TELEMETRY\n", style="bold #a7c189")
+        t.append("━" * 28 + "\n", style="dim #8ba672")
 
         node = (
             self._mesh_nodes.get(self._selected) if self._selected
@@ -627,20 +890,20 @@ class TelemetryPanel(Static):
 
         hex_id = node.node_id.lstrip("!")[-8:].upper()
         mac = ":".join(hex_id[i:i+2] for i in range(0, 8, 2))
-        t.append(f"  !{hex_id.lower()}", style="dim green")
-        t.append(f"  [{node.short_name}]\n", style="dim cyan")
-        t.append(f"  {mac}\n", style="dim green")
+        t.append(f"  !{hex_id.lower()}", style="dim #8ba672")
+        t.append(f"  [{node.short_name}]\n", style="dim #7ba9a0")
+        t.append(f"  {mac}\n", style="dim #8ba672")
 
         if node.hw_model:
-            t.append(f"  {'hw':<11}", style="dim green")
-            t.append(f"{node.hw_model}\n", style="cyan")
+            t.append(f"  {'hw':<11}", style="dim #8ba672")
+            t.append(f"{node.hw_model}\n", style="#7ba9a0")
         if node.firmware:
-            t.append(f"  {'firmware':<11}", style="dim green")
-            t.append(f"{node.firmware}\n", style="cyan")
+            t.append(f"  {'firmware':<11}", style="dim #8ba672")
+            t.append(f"{node.firmware}\n", style="#7ba9a0")
         t.append("\n")
 
-        def row(label: str, value, style: str = "bright_green"):
-            t.append(f"  {label:<11}", style="dim green")
+        def row(label: str, value, style: str = "#a7c189"):
+            t.append(f"  {label:<11}", style="dim #8ba672")
             if isinstance(value, Text):
                 t.append_text(value)
             else:
@@ -648,7 +911,7 @@ class TelemetryPanel(Static):
             t.append("\n")
 
         if node.battery_level is not None:
-            t.append(f"  {'battery':<11}", style="dim green")
+            t.append(f"  {'battery':<11}", style="dim #8ba672")
             t.append_text(node.battery_text())
             t.append("\n")
 
@@ -656,33 +919,76 @@ class TelemetryPanel(Static):
             row("voltage", f"{node.voltage:.2f}V")
 
         if node.rssi is not None:
-            rc = "bright_green" if node.rssi > -100 else "yellow" if node.rssi > -120 else "red"
+            rc = "#a7c189" if node.rssi > -100 else "yellow" if node.rssi > -120 else "red"
             row("rssi", f"{node.rssi} dBm", rc)
 
         if node.snr is not None:
-            t.append(f"  {'snr':<11}", style="dim green")
+            t.append(f"  {'snr':<11}", style="dim #8ba672")
             t.append_text(node.signal_text())
             t.append("\n")
 
         if not node.is_mine:
-            t.append(f"  {'hops':<11}", style="dim green")
+            t.append(f"  {'hops':<11}", style="dim #8ba672")
             t.append_text(node.hops_text())
             t.append("\n")
 
         if node.air_util_tx is not None:
-            util_color = "bright_green" if node.air_util_tx < 20 else "yellow" if node.air_util_tx < 50 else "red"
+            util_color = "#a7c189" if node.air_util_tx < 20 else "yellow" if node.air_util_tx < 50 else "red"
             row("air tx", f"{node.air_util_tx:.1f}%", util_color)
 
         if node.channel_util is not None:
-            ch_color = "bright_green" if node.channel_util < 15 else "yellow" if node.channel_util < 40 else "red"
+            ch_color = "#a7c189" if node.channel_util < 15 else "yellow" if node.channel_util < 40 else "red"
             row("ch util", f"{node.channel_util:.1f}%", ch_color)
 
         if node.latitude is not None:
-            row("lat", f"{node.latitude:.5f}°", "cyan")
-            row("lon", f"{node.longitude:.5f}°", "cyan")
+            row("lat", f"{node.latitude:.5f}°", "#7ba9a0")
+            row("lon", f"{node.longitude:.5f}°", "#7ba9a0")
             if node.altitude is not None:
-                row("alt", f"{node.altitude}m", "cyan")
+                row("alt", f"{node.altitude}m", "#7ba9a0")
 
+        return t
+
+
+# ── Waterfall ─────────────────────────────────────────────────────────────────
+
+class WaterfallBar(Static):
+    """SDR-style scrolling activity strip — one column per recent packet,
+    height = signal strength (SNR), color = sending node."""
+
+    _BLOCKS = " ▁▂▃▄▅▆▇█"
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._events: deque = deque(maxlen=512)  # (color, level 1..8)
+        self._frame = 0
+
+    def on_mount(self) -> None:
+        self.set_interval(0.2, self._tick)
+
+    def _tick(self) -> None:
+        self._frame += 1
+        self.refresh()
+
+    def push(self, color: Optional[str], snr: Optional[float]) -> None:
+        if snr is None:
+            level = 4
+        else:
+            level = max(1, min(8, int((snr + 20) / 34 * 8) + 1))
+        self._events.append((color or "#8ba672", level))
+        self.refresh()
+
+    def render(self) -> Text:
+        w = max(8, self.size.width)
+        t = Text(no_wrap=True, overflow="crop")
+        t.append("RF ", style="dim #8ba672")
+        cols = max(1, w - 5)  # leave room for "RF " + live cursor
+        recent = list(self._events)[-cols:]
+        pad = cols - len(recent)
+        if pad > 0:
+            t.append("▁" * pad, style="dim #1c241a")
+        for color, level in recent:
+            t.append(self._BLOCKS[level], style=color)
+        t.append("▍" if self._frame % 2 else "▏", style="#a7c189")
         return t
 
 
@@ -690,8 +996,8 @@ class TelemetryPanel(Static):
 
 APP_CSS = """
 Screen {
-    background: #060c06;
-    color: #00cc33;
+    background: ansi_default;
+    color: #8ba672;
     layers: base overlay;
 }
 
@@ -700,28 +1006,35 @@ Screen {
     offset: 0 0;
     width: 100%;
     height: 100%;
-    background: #060c06;
+    background: ansi_default;
     content-align: center middle;
-    color: #00ff41;
+    color: #a7c189;
 }
 
 #header-bar {
     height: 6;
-    background: #020802;
-    border-bottom: solid #0d2b0d;
+    background: ansi_default;
+    border-bottom: solid #243024;
     padding: 1 2;
-    color: #00ff41;
+    color: #a7c189;
+}
+
+#waterfall {
+    height: 1;
+    background: ansi_default;
+    color: #8ba672;
+    padding: 0 1;
 }
 
 #body {
     height: 1fr;
-    background: #060c06;
+    background: ansi_default;
 }
 
 #left-scroll {
     width: 30;
-    border-right: solid #0d2b0d;
-    background: #030a03;
+    border-right: solid #243024;
+    background: ansi_default;
 }
 
 #node-list {
@@ -729,80 +1042,116 @@ Screen {
     height: auto;
     min-height: 100%;
     padding: 0 1;
-    background: #030a03;
+    background: ansi_default;
 }
 
 #message-feed {
     width: 1fr;
     height: 1fr;
-    background: #060c06;
-    scrollbar-color: #1a3d1a #060c06;
+    background: ansi_default;
+    scrollbar-color: #2c3a2c;
+    scrollbar-background: ansi_default;
     padding: 0 1;
 }
 
 #right-panel {
     width: 38;
     height: 1fr;
-    border-left: solid #0d2b0d;
-    background: #030a03;
+    border-left: solid #243024;
+    background: ansi_default;
 }
 
 #map-view {
     width: 100%;
     height: auto;
-    background: #030a03;
+    background: ansi_default;
     padding: 0;
-    border-bottom: solid #0d2b0d;
+    border-bottom: solid #243024;
 }
 
 #telemetry-view {
     width: 100%;
     height: auto;
-    background: #030a03;
+    background: ansi_default;
     padding: 0 1;
 }
 
 #input-container {
     height: 3;
-    background: #020802;
-    border-top: solid #00ff41;
+    background: ansi_default;
+    border-top: solid #3a4d36;
     align: left middle;
     padding: 0 1;
 }
 
 #prompt-label {
-    color: #00ff41;
+    color: #a7c189;
     width: auto;
-    background: #020802;
+    background: ansi_default;
     text-style: bold;
 }
 
 #chat-input {
-    background: #020802;
-    color: #00ff41;
+    background: ansi_default;
+    color: #a7c189;
     border: none;
     width: 1fr;
 }
 
 #chat-input:focus {
     border: none;
-    background: #020802;
+    background: ansi_default;
+}
+
+#sniffer {
+    height: 13;
+    display: none;
+    background: ansi_default;
+    color: #8ba672;
+    border: round #243024;
+    padding: 0 1;
+    scrollbar-color: #2c3a2c;
+    scrollbar-background: ansi_default;
 }
 """
 
 
-# ── Keycap emoji width compensation ──────────────────────────────────────────
+# ── Emoji handling ────────────────────────────────────────────────────────────
+# Meshtastic names/messages routinely contain emoji. Terminal fonts render emoji
+# at widths that disagree with Rich's cell math, which shifts the monospace grid.
+# We strip decorative emoji but PRESERVE number-emoji "tapbacks" (people react to
+# a message with 1..10 keycap emoji to indicate hop count) as plain digits.
 
-_KEYCAP_RE = re.compile('\uFE0F\u20E3')
+# digit/#/* + optional VS16 + combining enclosing keycap  ->  bare char  (3-keycap -> 3)
+_KEYCAP_RE = re.compile('([0-9#*])️?⃣')
 
-def _fix_keycap_width(text: str) -> str:
-    """Insert a space after each keycap emoji (1️⃣  2️⃣  etc.).
+# Pictograph / emoji ranges to drop (decorative). Excludes U+25xx geometric shapes
+# (used by the UI itself) and arrows.
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F000-\U0001FAFF"   # SMP emoji: faces, animals, symbols
+    "\U00002600-\U000027BF"   # misc symbols + dingbats
+    "\U00002B00-\U00002B23\U00002B25-\U00002BFF"   # misc symbols & arrows (keep ⬤ U+2B24)
+    "\U00002300-\U000023CD\U000023CF-\U000023FF"   # misc technical (keep ⏎ U+23CE)
+    "\U0000FE00-\U0000FE0F"   # variation selectors
+    "\U0000200D"              # zero-width joiner
+    "\U000020E3"              # stray combining enclosing keycap
+    "]+"
+)
 
-    Keycap sequences (digit + U+FE0F + U+20E3) are measured as 2 cells by
-    Rich but rendered as 1 cell by many terminals.  Adding a space after each
-    makes the terminal rendering match Rich's cell count.
-    """
-    return _KEYCAP_RE.sub('\uFE0F\u20E3 ', text)
+def _strip_emoji(text: str) -> str:
+    """Drop decorative emoji but keep number-emoji tapbacks as plain digits."""
+    if not text:
+        return text
+    text = text.replace('\U0001F51F', '10')   # keycap-ten -> 10 (before range-strip)
+    text = _KEYCAP_RE.sub(r'\1', text)         # 3-keycap -> 3  (preserve hop tapbacks)
+    text = _EMOJI_RE.sub('', text)             # drop the rest
+    return re.sub(r'\s{2,}', ' ', text).strip()
+
+def _clean_name(name: str, fallback: str) -> str:
+    """Emoji-stripped node name; if nothing readable remains, use `fallback`."""
+    cleaned = _strip_emoji(name or "")
+    return cleaned if cleaned else fallback
 
 
 def _wrap_with_indent(text: str, line_w: int, indent: int) -> str:
@@ -832,22 +1181,44 @@ def _wrap_with_indent(text: str, line_w: int, indent: int) -> str:
 
 # ── Init overlay ─────────────────────────────────────────────────────────────
 
-class InitOverlay(Static):
-    """Full-screen splash shown while the app boots, with a cycling dot animation."""
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
-    _dot_step = reactive(0)
+class InitOverlay(Static):
+    """Full-screen boot splash: spinner + boot log that types in line-by-line."""
+
+    _frame = reactive(0)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._lines: List[str] = []
 
     def on_mount(self) -> None:
-        self.set_interval(0.4, self._tick)
+        self._timer = self.set_interval(0.08, self._tick)
 
     def _tick(self) -> None:
-        self._dot_step = (self._dot_step + 1) % 3
+        if not self.display:  # boot finished and dismissed the overlay — stop ticking
+            self._timer.stop()
+            return
+        self._frame += 1
+
+    def log_line(self, text: str) -> None:
+        self._lines.append(text)
+        self.refresh()
 
     def render(self) -> Text:
-        dots = "." * (self._dot_step + 1)
-        t = Text()
-        t.append("Initializing", style="bold bright_green")
-        t.append(dots, style="bold bright_green")
+        spin = _SPINNER[self._frame % len(_SPINNER)]
+        dots = "." * ((self._frame // 3) % 4)
+        t = Text(justify="center")
+        t.append("\n")
+        t.append(HeaderBar.LOGO + "\n\n", style="bold #a7c189")
+        t.append("mesh network terminal\n\n", style="dim #8ba672")
+        t.append(f"{spin} ", style="bold #a7c189")
+        t.append(f"initializing meshenger{dots}\n\n", style="bold #a7c189")
+        shown = self._lines[-6:]
+        for i, ln in enumerate(shown):
+            last = i == len(shown) - 1
+            t.append(f"{spin if last else '✓'} {ln}\n",
+                     style="#a7c189" if last else "dim #8ba672")
         return t
 
 
@@ -873,11 +1244,17 @@ class MeshLoungeApp(App):
     BINDINGS = [
         Binding("ctrl+t", "toggle_panels", "Toggle map",     priority=True),
         Binding("ctrl+r", "refresh_screen", "Refresh screen", priority=True),
+        Binding("ctrl+l", "toggle_links",   "Map links",      priority=True),
+        Binding("ctrl+g", "toggle_mapmode", "Map mode",       priority=True),
+        Binding("ctrl+p", "toggle_sniffer", "Packet capture", priority=True),
+        Binding("tab",    "focus_nodes",    "Node nav",       priority=True),
     ]
 
     def __init__(self, port: Optional[str] = None, host: Optional[str] = None,
                  baud: int = 115200, ble: Optional[str] = None, **kwargs):
-        super().__init__(**kwargs)
+        # ansi_color=True keeps Textual in native-ANSI mode so `background: ansi_default`
+        # emits the terminal's real default background instead of a flattened RGB color.
+        super().__init__(ansi_color=True, **kwargs)
         self._port = port
         self._host = host
         self._baud = baud
@@ -889,11 +1266,23 @@ class MeshLoungeApp(App):
         self._node_colors: Dict[str, str] = {}
         self._color_idx: int = 0
         self._selected_node: Optional[str] = None
+        self._rf_pulse: Dict[str, float] = {}  # node_id -> last packet time (map bloom + waterfall)
+        self._pkt_times: deque = deque(maxlen=4000)  # packet arrival times (for packets/min gauge)
+        # ── alerts ──
+        self._alerts_on = True
+        self._alerts_primed = False
+        self._alerts_grace_until = 0.0
+        self._online_prev: set = set()
+        self._known_nodes: set = set()
+        self._lowbatt_warned: set = set()
+        # ── traceroute ──
+        self._trace_pending: Optional[str] = None  # node_id we asked to trace
 
     # ── Compose ───────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield HeaderBar(id="header-bar")
+        yield WaterfallBar(id="waterfall")
         with Horizontal(id="body"):
             with ScrollableContainer(id="left-scroll"):
                 yield NodeListPanel(id="node-list")
@@ -907,6 +1296,7 @@ class MeshLoungeApp(App):
             with ScrollableContainer(id="right-panel"):
                 yield MapPanel(id="map-view")
                 yield TelemetryPanel(id="telemetry-view")
+        yield ClippedRichLog(id="sniffer", markup=True, max_lines=400, auto_scroll=True)
         with Horizontal(id="input-container"):
             yield Static("▶ ", id="prompt-label")
             yield Input(
@@ -918,7 +1308,10 @@ class MeshLoungeApp(App):
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def on_mount(self) -> None:
-        await self._boot_sequence()
+        self.query_one("#sniffer").border_title = "⊟ PACKET CAPTURE  ·  ^p close"
+        # Run boot in a worker so the splash actually animates (awaiting it here
+        # would block the first paint and freeze the spinner on one frame).
+        self.run_worker(self._boot_sequence(), exclusive=False)
 
     def on_unmount(self) -> None:
         """Unsubscribe pubsub listeners. Do NOT call interface.close() here —
@@ -941,42 +1334,49 @@ class MeshLoungeApp(App):
 
     async def _boot_sequence(self) -> None:
         self._sys("━" * 60)
-        self._sys("[bold bright_green]instant_meshenger[/bold bright_green] v1.0 // meshtastic terminal")
+        self._sys("[bold #a7c189]instant_meshenger[/bold #a7c189] v1.0 // meshtastic terminal")
         self._sys("━" * 60)
 
         if not MESH_AVAILABLE and (self._port or self._host or self._ble is not None):
             self._sys("[yellow]meshtastic not installed — pip install meshtastic pypubsub[/yellow]")
 
+        overlay = self.query_one("#init-overlay", InitOverlay)
         for msg in BOOT_MSGS:
-            self._sys(f"  [dim green]▸[/dim green] {msg}")
-            await asyncio.sleep(0.12)
+            overlay.log_line(msg)
+            self._sys(f"  [dim #8ba672]▸[/dim #8ba672] {msg}")
+            await asyncio.sleep(0.22)
 
-        self._load_message_history()
+        try:
+            self._load_message_history()
 
-        if self._demo_mode:
-            self._sys("")
-            self._sys("[yellow]◈ DEMO MODE[/yellow] — no device connected")
-            self._sys("  use [cyan]--port /dev/ttyUSB0[/cyan] or [cyan]--host IP[/cyan] to connect live")
-            self._sys("  radio: preset [cyan]LongFast[/cyan]  region [cyan]US[/cyan]  [dim](simulated)[/dim]")
-            self.query_one("#header-bar", HeaderBar).freq_info = "LongFast/US (demo)"
-            self._sys("")
-            await asyncio.sleep(0.3)
-            await self._init_demo()
-        else:
-            self._sys("")
-            await self._connect_mesh()
-
-        self.set_interval(0.5,  self._tick_header)
-        self.set_interval(1.5,  self._tick_panels)
-        self.set_interval(0.7,  self._tick_map)
-        self.set_interval(20.0, lambda: self.refresh(layout=True))
-        if self._demo_mode:
-            self.set_interval(6.0, self._demo_event)
-        self.call_after_refresh(self._tick_panels)
-        self.call_after_refresh(self._tick_header)
-
-        # Boot complete — dismiss the init overlay
-        self.query_one("#init-overlay", InitOverlay).display = False
+            if self._demo_mode:
+                self._sys("")
+                self._sys("[yellow]◈ DEMO MODE[/yellow] — no device connected")
+                self._sys("  use [#7ba9a0]--port /dev/ttyUSB0[/#7ba9a0] or [#7ba9a0]--host IP[/#7ba9a0] to connect live")
+                self._sys("  radio: preset [#7ba9a0]LongFast[/#7ba9a0]  region [#7ba9a0]US[/#7ba9a0]  [dim](simulated)[/dim]")
+                self.query_one("#header-bar", HeaderBar).freq_info = "LongFast/US (demo)"
+                self._sys("")
+                await asyncio.sleep(0.3)
+                await self._init_demo()
+            else:
+                self._sys("")
+                await self._connect_mesh()
+        except Exception as e:
+            self._sys(f"[red]boot error:[/red] {e}")
+        finally:
+            # Always start the timers and dismiss the splash, even if connect/demo failed —
+            # otherwise the full-screen overlay would cover the UI forever.
+            self.set_interval(0.5,  self._tick_header)
+            self.set_interval(1.5,  self._tick_panels)
+            self.set_interval(0.3,  self._tick_map)
+            self.set_interval(3.0,  self._check_alerts)
+            self.set_interval(20.0, lambda: self.refresh(layout=True))
+            if self._demo_mode:
+                self.set_interval(6.0, self._demo_event)
+                self.set_interval(0.55, self._demo_rf)
+            self.call_after_refresh(self._tick_panels)
+            self.call_after_refresh(self._tick_header)
+            self.query_one("#init-overlay", InitOverlay).display = False
 
     # ── System Messages ───────────────────────────────────────────────────────
 
@@ -984,8 +1384,8 @@ class MeshLoungeApp(App):
         feed = self.query_one("#message-feed", RichLog)
         ts = datetime.now().strftime("%H:%M:%S")
         line = Text()
-        line.append(f"[{ts}] ", style="dim green")
-        line.append("◈ ", style="bright_green")
+        line.append(f"[{ts}] ", style="dim #8ba672")
+        line.append("◈ ", style="#a7c189")
         line.append_text(Text.from_markup(text))
         feed.write(line)
 
@@ -1053,45 +1453,56 @@ class MeshLoungeApp(App):
         color = self._node_colors.get(msg.sender_id, "white")
 
         t = Text()
-        t.append(f"[{ts}] ", style="dim green")
+        t.append(f"[{ts}] ", style="dim #8ba672")
 
         if msg.is_system:
-            t.append("◈ ", style="dim green")
-            t.append(_fix_keycap_width(msg.text), style="dim green")
+            t.append("◈ ", style="dim #8ba672")
+            t.append(_strip_emoji(msg.text), style="dim #8ba672")
             feed.write(t)
             return
+
+        # Prefer the live node entry's name — it may have been learned after the message was stored
+        node = self.nodes.get(msg.sender_id)
+        if node:
+            sender_name = self._display_name(node)
+        elif self._has_name(_strip_emoji(msg.sender_name)):
+            sender_name = _strip_emoji(msg.sender_name)
+        elif msg.sender_id:
+            sender_name = self._unknown_node_name(msg.sender_id)
+        else:
+            sender_name = "?"
 
         # Build plain prefix string to measure its visual width for hanging indent
         prefix_plain = f"[{ts}] "
         if msg.is_dm:
             t.append("⬤DM ", style="bold magenta")
             prefix_plain += "⬤DM "
-        t.append(f"<{msg.sender_name}>", style=f"bold {color}")
+        t.append(f"<{sender_name}>", style=f"bold {color}")
         t.append("  ")
-        prefix_plain += f"<{msg.sender_name}>  "
+        prefix_plain += f"<{sender_name}>  "
         indent = cell_len(prefix_plain)
 
         # Word-wrap message so continuation lines align under the message text
         content_w = max(20, (feed.size.width or 100) - 2)  # -2 for widget padding
-        wrapped = _wrap_with_indent(_fix_keycap_width(msg.text), content_w - indent, indent)
+        wrapped = _wrap_with_indent(_strip_emoji(msg.text), content_w - indent, indent)
         t.append(wrapped, style="white")
 
         meta = []
         if msg.snr is not None:
-            snr_col = "bright_green" if msg.snr > 0 else "yellow" if msg.snr > -10 else "red"
+            snr_col = "#a7c189" if msg.snr > 0 else "yellow" if msg.snr > -10 else "red"
             meta.append(Text(f"{msg.snr:+.0f}dB", style=f"dim {snr_col}"))
         if msg.rssi is not None:
             meta.append(Text(f"{msg.rssi}dBm", style="dim"))
         if msg.hops > 0:
-            meta.append(Text(f"↝{msg.hops}", style="dim cyan"))
+            meta.append(Text(f"↝{msg.hops}", style="dim #7ba9a0"))
 
         if meta:
-            t.append("  [", style="dim green")
+            t.append("  [", style="dim #8ba672")
             for i, m in enumerate(meta):
                 if i:
-                    t.append(" ", style="dim green")
+                    t.append(" ", style="dim #8ba672")
                 t.append_text(m)
-            t.append("]", style="dim green")
+            t.append("]", style="dim #8ba672")
 
         feed.write(t)
 
@@ -1106,6 +1517,11 @@ class MeshLoungeApp(App):
             header.connection_status = "◈ DEMO"
         else:
             header.connection_status = "● LIVE" if self.interface else "◌ OFFLINE"
+
+        now = time.time()
+        header.packets_per_min = sum(1 for t in self._pkt_times if now - t < 60)
+        mine = next((n for n in self.nodes.values() if n.is_mine), None)
+        header.channel_util = mine.channel_util if mine else None
         header.refresh()
 
     def _tick_panels(self) -> None:
@@ -1113,7 +1529,7 @@ class MeshLoungeApp(App):
         nl.update_nodes(self.nodes, self._node_colors, self._selected_node)
 
         mp = self.query_one("#map-view", MapPanel)
-        mp.update_nodes(self.nodes, self._node_colors)
+        mp.update_nodes(self.nodes, self._node_colors, self._rf_pulse)
 
         tp = self.query_one("#telemetry-view", TelemetryPanel)
         tp.update_data(self.nodes, self._node_colors, self._selected_node)
@@ -1124,13 +1540,33 @@ class MeshLoungeApp(App):
     @on(NodeListPanel.NodeSelected)
     def handle_node_selected(self, event: NodeListPanel.NodeSelected) -> None:
         self._selected_node = event.node_id
-        node = self.nodes.get(event.node_id)
-        if node:
-            self._sys(f"telemetry focused on [cyan]{node.long_name}[/cyan]")
         tp = self.query_one("#telemetry-view", TelemetryPanel)
         tp.update_data(self.nodes, self._node_colors, self._selected_node)
         nl = self.query_one("#node-list", NodeListPanel)
         nl.update_nodes(self.nodes, self._node_colors, self._selected_node)
+        self.call_after_refresh(self._scroll_node_into_view)
+
+    @on(NodeListPanel.NodeActivated)
+    def handle_node_activated(self, event: NodeListPanel.NodeActivated) -> None:
+        node = self.nodes.get(event.node_id)
+        if not node:
+            return
+        short = node.short_name if self._has_name(node.short_name) else self._unknown_node_name(node.node_id)
+        inp = self.query_one("#chat-input", Input)
+        inp.value = f"/dm {short} "
+        inp.cursor_position = len(inp.value)
+        inp.focus()
+        self._sys(f"✉ DM to [#7ba9a0]{node.long_name}[/#7ba9a0] — type your message and press enter")
+
+    def _scroll_node_into_view(self) -> None:
+        nl = self.query_one("#node-list", NodeListPanel)
+        line = nl.line_of(self._selected_node) if self._selected_node else None
+        if line is None:
+            return
+        try:
+            self.query_one("#left-scroll").scroll_to(y=max(0, line - 2), animate=False)
+        except Exception:
+            pass
 
     def _tick_map(self) -> None:
         self.query_one("#map-view", MapPanel).tick()
@@ -1139,10 +1575,152 @@ class MeshLoungeApp(App):
         panel = self.query_one("#right-panel")
         panel.display = not panel.display
 
+    def action_focus_nodes(self) -> None:
+        """Tab: jump focus into the node list for j/k nav (or back to the input)."""
+        nl = self.query_one("#node-list", NodeListPanel)
+        if nl.has_focus:
+            self.query_one("#chat-input").focus()
+            return
+        if self._selected_node is None and self.nodes:
+            order = sorted(self.nodes.values(),
+                           key=lambda n: (not n.is_mine, not n.is_online, n.long_name.lower()))
+            self._selected_node = order[0].node_id
+        nl.update_nodes(self.nodes, self._node_colors, self._selected_node)
+        nl.focus()
+        self.call_after_refresh(self._scroll_node_into_view)
+
+    def action_toggle_links(self) -> None:
+        on = self.query_one("#map-view", MapPanel).toggle_links()
+        self._sys(f"map links [#7ba9a0]{'on' if on else 'off'}[/#7ba9a0]")
+
+    def action_toggle_mapmode(self) -> None:
+        mode = self.query_one("#map-view", MapPanel).toggle_mode()
+        label = "mesh topology (hops)" if mode == "hops" else "gps grid"
+        self._sys(f"map view: [#7ba9a0]{label}[/#7ba9a0]")
+
     def action_refresh_screen(self) -> None:
         self.refresh(layout=True)
         self._tick_panels()
         self._tick_map()
+
+    def action_toggle_sniffer(self) -> None:
+        s = self.query_one("#sniffer")
+        s.display = not s.display
+        self._sys(f"packet capture [#7ba9a0]{'on' if s.display else 'off'}[/#7ba9a0]")
+
+    _PORT_ABBR = {
+        "TEXT_MESSAGE_APP": "TEXT", "POSITION_APP": "POS", "TELEMETRY_APP": "TELE",
+        "NODEINFO_APP": "INFO", "ROUTING_APP": "RTE", "TRACEROUTE_APP": "TRACE",
+    }
+    _PORT_COLOR = {
+        "TEXT": "#a7c189", "POS": "#7ba9a0", "TELE": "#b6c28f",
+        "INFO": "#8aa4c2", "TRACE": "#c2a86a", "RTE": "#9fb0c8",
+    }
+
+    def _capture_packet(self, from_id: str, to_id: str, port: str,
+                        snr: Optional[float], rssi: Optional[int], size: int, hops: int) -> None:
+        """Append one line to the tcpdump-style packet-capture pane."""
+        try:
+            log = self.query_one("#sniffer", ClippedRichLog)
+        except Exception:
+            return
+        src = self.nodes.get(from_id)
+        src_name = self._display_name(src) if src else self._unknown_node_name(from_id)
+        dst = "ALL" if to_id in ("!ffffffff", "!ffffffffff") else (
+            self._display_name(self.nodes[to_id]) if to_id in self.nodes
+            else self._unknown_node_name(to_id))
+        abbr = self._PORT_ABBR.get(port, (port or "?")[:5])
+        pc = self._PORT_COLOR.get(abbr, "#8ba672")
+        snr_s = f"{snr:+.0f}".rjust(3) if snr is not None else "  ·"
+        rssi_s = f"{rssi}".rjust(4) if rssi is not None else "   ·"
+        t = Text()
+        t.append(datetime.now().strftime("%H:%M:%S "), style="dim #5b6b50")
+        t.append(f"{src_name[:10]:<10}", style="#8ba672")
+        t.append("→", style="dim #5b6b50")
+        t.append(f"{dst[:10]:<10} ", style="dim #8ba672")
+        t.append(f"{abbr:<5}", style=f"bold {pc}")
+        t.append(f" {snr_s}dB {rssi_s}dBm", style="dim #7ba9a0")
+        t.append(f" {size:>3}b", style="dim #8ba672")
+        t.append(f" ↝{hops}" if hops else "   ", style="dim #7ba9a0")
+        log.write(t)
+
+    def _record_rf(self, node_id: str, snr: Optional[float]) -> None:
+        """Register a packet from node_id: blooms the map glyph + feeds the waterfall."""
+        self._rf_pulse[node_id] = time.time()
+        self._pkt_times.append(time.time())
+        try:
+            wf = self.query_one("#waterfall", WaterfallBar)
+        except Exception:
+            return  # widgets not mounted yet (early boot packet)
+        wf.push(self._node_colors.get(node_id), snr)
+
+    # ── Alerts ────────────────────────────────────────────────────────────────
+
+    def _alert(self, text: str, *, bell: bool = False) -> None:
+        if not self._alerts_on:
+            return
+        if bell:
+            try:
+                self.bell()
+            except Exception:
+                pass
+        try:
+            feed = self.query_one("#message-feed", RichLog)
+        except Exception:
+            return
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = Text()
+        line.append(f"[{ts}] ", style="dim #8ba672")
+        line.append(" ⚑ ", style="bold #0e120e on #c2a86a")
+        line.append(f" {text}", style="bold #c2a86a")
+        feed.write(line)
+
+    # Only alert about nodes we can hear directly (≤ this many hops). On a big
+    # mesh, distant nodes constantly flap in/out of the heard-window and would
+    # flood the feed — that churn isn't actionable, so we ignore it.
+    _ALERT_MAX_HOPS = 1
+
+    def _check_alerts(self) -> None:
+        """Periodic watch — DIRECT NEIGHBORS only: new neighbor, neighbor dark, low battery."""
+        now = time.time()
+        now_online = {nid for nid, n in self.nodes.items() if n.is_online and not n.is_mine}
+
+        # First run primes a baseline; a settle window then absorbs the initial
+        # node-DB stream (which would otherwise fire a wall of "went dark").
+        if not self._alerts_primed:
+            self._known_nodes = set(self.nodes)
+            self._online_prev = now_online
+            self._alerts_primed = True
+            self._alerts_grace_until = now + 45.0
+            return
+        in_grace = now < self._alerts_grace_until
+
+        def is_neighbor(n: MeshNode) -> bool:
+            return n is not None and not n.is_mine and n.hops_away <= self._ALERT_MAX_HOPS
+
+        # New neighbor joined (keep baselines current during grace, but stay quiet)
+        for nid, n in self.nodes.items():
+            if nid in self._known_nodes or n.is_mine or not self._has_name(n.short_name):
+                continue
+            self._known_nodes.add(nid)
+            if not in_grace and is_neighbor(n):
+                self._alert(f"✦ new neighbor: {n.long_name}")
+
+        for nid in (self._online_prev - now_online):
+            n = self.nodes.get(nid)
+            if not in_grace and is_neighbor(n):
+                self._alert(f"⚠ neighbor went dark: {n.long_name}")
+        self._online_prev = now_online
+
+        for nid, n in self.nodes.items():
+            if n.is_mine or n.battery_level is None or n.hops_away > self._ALERT_MAX_HOPS:
+                continue
+            if n.battery_level < 15 and nid not in self._lowbatt_warned:
+                self._lowbatt_warned.add(nid)
+                if not in_grace:
+                    self._alert(f"🪫 low battery: {n.long_name} at {n.battery_level}%")
+            elif n.battery_level > 20:
+                self._lowbatt_warned.discard(nid)
 
     # ── Demo Mode ─────────────────────────────────────────────────────────────
 
@@ -1199,10 +1777,10 @@ class MeshLoungeApp(App):
             await asyncio.sleep(0.04)
 
         online_count = sum(1 for n in self.nodes.values() if n.is_online)
-        self._sys(f"mesh online: [bright_green]{len(self.nodes)}[/bright_green] nodes discovered, "
-                  f"[bright_green]{online_count}[/bright_green] online")
-        self._sys(f"channel: [cyan]{CHANNEL_NAMES[self.current_channel]}[/cyan]  "
-                  f"sf: [cyan]SF12[/cyan]  bw: [cyan]125kHz[/cyan]  cr: [cyan]4/5[/cyan]")
+        self._sys(f"mesh online: [#a7c189]{len(self.nodes)}[/#a7c189] nodes discovered, "
+                  f"[#a7c189]{online_count}[/#a7c189] online")
+        self._sys(f"channel: [#7ba9a0]{CHANNEL_NAMES[self.current_channel]}[/#7ba9a0]  "
+                  f"sf: [#7ba9a0]SF12[/#7ba9a0]  bw: [#7ba9a0]125kHz[/#7ba9a0]  cr: [#7ba9a0]4/5[/#7ba9a0]")
         self._sys("━" * 60)
 
         demo_nodes = [n for n in self.nodes.values() if not n.is_mine]
@@ -1250,6 +1828,7 @@ class MeshLoungeApp(App):
             node.last_heard = time.time()
             node.snr = snr
             node.rssi = rssi
+            self._record_rf(node.node_id, snr)
 
         elif roll < 0.65:
             # Telemetry update
@@ -1257,6 +1836,7 @@ class MeshLoungeApp(App):
             node.battery_level = max(0, min(100, (node.battery_level or 50) + random.randint(-3, 1)))
             node.snr = round(random.uniform(-15, 12), 1)
             node.rssi = random.randint(-130, -65)
+            self._record_rf(node.node_id, node.snr)
 
         elif roll < 0.72:
             # Position update (small drift)
@@ -1265,6 +1845,7 @@ class MeshLoungeApp(App):
                 node.latitude += random.uniform(-0.0005, 0.0005)
                 node.longitude += random.uniform(-0.0005, 0.0005)
                 node.last_heard = time.time()
+                self._record_rf(node.node_id, node.snr)
 
         elif roll < 0.77:
             # Rare: node goes offline/online
@@ -1273,14 +1854,28 @@ class MeshLoungeApp(App):
                 node.last_heard = time.time() - 1000
             else:
                 node.last_heard = time.time()
-                self._sys(f"[bright_green]◆ node online:[/bright_green] {node.long_name}")
+                self._sys(f"[#a7c189]◆ node online:[/#a7c189] {node.long_name}")
+
+    def _demo_rf(self) -> None:
+        """Lightweight simulated airwaves chatter — feeds the waterfall + map pulse
+        without posting chat. Online nodes transmit more often."""
+        online = [n for n in self.nodes.values() if not n.is_mine and n.is_online]
+        if not online:
+            return
+        weights = [3 if n.hops_away == 0 else 2 if n.hops_away <= 2 else 1 for n in online]
+        node = random.choices(online, weights=weights, k=1)[0]
+        snr = node.snr if node.snr is not None else round(random.uniform(-12, 10), 1)
+        self._record_rf(node.node_id, snr)
+        port = random.choice(["TELEMETRY_APP", "POSITION_APP", "NODEINFO_APP", "TEXT_MESSAGE_APP"])
+        self._capture_packet(node.node_id, "!ffffffff", port, snr, node.rssi,
+                             random.randint(8, 64), node.hops_away)
 
     # ── Meshtastic Connection ─────────────────────────────────────────────────
 
     async def _connect_mesh(self) -> None:
         if not MESH_AVAILABLE:
             self._sys("[red]meshtastic library not available[/red]")
-            self._sys("  run: [cyan]pip install meshtastic pypubsub[/cyan]")
+            self._sys("  run: [#7ba9a0]pip install meshtastic pypubsub[/#7ba9a0]")
             self._demo_mode = True
             await self._init_demo()
             return
@@ -1298,19 +1893,19 @@ class MeshLoungeApp(App):
                     raise RuntimeError("bleak not installed")
                 target = self._ble if self._ble else None  # empty string = auto-discover
                 label = self._ble if self._ble else "auto-discover"
-                self._sys(f"connecting via BLE ([cyan]{label}[/cyan])...")
+                self._sys(f"connecting via BLE ([#7ba9a0]{label}[/#7ba9a0])...")
                 self._sys("  [dim]make sure Bluetooth is on and node is nearby[/dim]")
                 # BLEInterface blocks during scan+connect — run in thread so the UI stays alive
                 self.interface = await loop.run_in_executor(
                     None, lambda: meshtastic.ble_interface.BLEInterface(target)
                 )
             elif self._host:
-                self._sys(f"connecting to [cyan]{self._host}[/cyan] via TCP...")
+                self._sys(f"connecting to [#7ba9a0]{self._host}[/#7ba9a0] via TCP...")
                 self.interface = await loop.run_in_executor(
                     None, lambda: meshtastic.tcp_interface.TCPInterface(self._host)
                 )
             else:
-                self._sys(f"connecting to [cyan]{self._port}[/cyan] ({self._baud} baud)...")
+                self._sys(f"connecting to [#7ba9a0]{self._port}[/#7ba9a0] ({self._baud} baud)...")
                 self.interface = await loop.run_in_executor(
                     None, lambda: meshtastic.serial_interface.SerialInterface(
                         self._port, debugOut=None
@@ -1321,11 +1916,12 @@ class MeshLoungeApp(App):
             self._sys("[yellow]falling back to demo mode[/yellow]")
             self._demo_mode = True
             self.set_interval(6.0, self._demo_event)
+            self.set_interval(0.55, self._demo_rf)
             await self._init_demo()
 
     def _on_connected(self, interface, topic=pub.AUTO_TOPIC) -> None:
         def update():
-            self._sys("[bright_green]◆ connected to device[/bright_green]")
+            self._sys("[#a7c189]◆ connected to device[/#a7c189]")
             self._log_radio_config(interface)
             self._load_node_db(interface)
         self.call_from_thread(update)
@@ -1351,8 +1947,8 @@ class MeshLoungeApp(App):
 
             # Build log message
             parts = [
-                f"preset [cyan]{preset_name}[/cyan]",
-                f"region [cyan]{region_name}[/cyan]",
+                f"preset [#7ba9a0]{preset_name}[/#7ba9a0]",
+                f"region [#7ba9a0]{region_name}[/#7ba9a0]",
             ]
             freq_mhz = None
 
@@ -1368,10 +1964,10 @@ class MeshLoungeApp(App):
                     # Field is in Hz when > 1 MHz; values <= 100 are likely unset/zero
                     if fhz and fhz > 1_000_000:
                         freq_mhz = fhz / 1e6
-                        parts.append(f"[cyan]{freq_mhz:.3f} MHz[/cyan]")
+                        parts.append(f"[#7ba9a0]{freq_mhz:.3f} MHz[/#7ba9a0]")
 
             if freq_offset:
-                parts.append(f"offset [cyan]{freq_offset:+}Hz[/cyan]")
+                parts.append(f"offset [#7ba9a0]{freq_offset:+}Hz[/#7ba9a0]")
             self._sys("  radio: " + "  ".join(parts))
 
             # Push to header bar
@@ -1399,8 +1995,56 @@ class MeshLoungeApp(App):
     def _ensure_node(self, from_id: str) -> None:
         """Create a placeholder node entry if we haven't seen this ID before."""
         if from_id not in self.nodes:
-            self.nodes[from_id] = MeshNode(node_id=from_id)
+            node = self._lookup_node_from_interface(from_id) or MeshNode(node_id=from_id)
+            self.nodes[from_id] = node
             self._assign_color(from_id)
+
+    @staticmethod
+    def _has_name(name: Optional[str]) -> bool:
+        """True if a node name is set and not the unknown-node placeholder."""
+        return bool(name) and name != "????"
+
+    @staticmethod
+    def _unknown_node_name(node_id: str) -> str:
+        """Canonical display name for a node we have no name for: last 4 hex of its id."""
+        return node_id.lstrip("!")[-4:].upper()
+
+    def _lookup_node_from_interface(self, node_id: str) -> Optional[MeshNode]:
+        """Build a MeshNode from the meshtastic lib's node cache, if it knows this node."""
+        iface = getattr(self, "interface", None)
+        if iface is None:
+            return None
+        data = (getattr(iface, "nodes", None) or {}).get(node_id)
+        if not data:
+            try:
+                num = int(node_id.lstrip("!"), 16)
+            except ValueError:
+                return None
+            data = (getattr(iface, "nodesByNum", None) or {}).get(num)
+        if not data:
+            return None
+        try:
+            return self._parse_node(node_id, data)
+        except Exception:
+            return None
+
+    def _refresh_name_if_missing(self, node: MeshNode) -> None:
+        """If we still hold the default name, try a late lookup from the device's node DB."""
+        if self._has_name(node.short_name):
+            return
+        fresh = self._lookup_node_from_interface(node.node_id)
+        if fresh is None:
+            return
+        if self._has_name(fresh.short_name):
+            node.short_name = fresh.short_name
+        if fresh.long_name and fresh.long_name != "Unknown":
+            node.long_name = fresh.long_name
+
+    def _display_name(self, node: MeshNode) -> str:
+        """Best available short name for chat display; falls back to hex id when unknown."""
+        if self._has_name(node.short_name):
+            return node.short_name
+        return self._unknown_node_name(node.node_id)
 
     def _on_lost(self, interface, topic=pub.AUTO_TOPIC) -> None:
         def update():
@@ -1420,7 +2064,7 @@ class MeshLoungeApp(App):
                     for num, data in nodes_by_num.items()
                 }
 
-            self._sys(f"device nodeDB: [cyan]{len(nodes_raw)}[/cyan] entries")
+            self._sys(f"device nodeDB: [#7ba9a0]{len(nodes_raw)}[/#7ba9a0] entries")
 
             my_num = self._get_my_node_num(interface)
 
@@ -1445,7 +2089,7 @@ class MeshLoungeApp(App):
                 self.nodes[nid] = node
                 self._assign_color(nid)
 
-            self._sys(f"loaded [bright_green]{len(self.nodes)}[/bright_green] nodes from device")
+            self._sys(f"loaded [#a7c189]{len(self.nodes)}[/#a7c189] nodes from device")
             self._tick_panels()
 
             # Schedule a delayed reload — some devices stream nodeinfo after initial connect
@@ -1492,10 +2136,11 @@ class MeshLoungeApp(App):
         # Use explicit None checks — never use `or None` for coords because 0.0 is a valid value
         lat = pos["latitude"] if "latitude" in pos and pos["latitude"] is not None else None
         lon = pos["longitude"] if "longitude" in pos and pos["longitude"] is not None else None
+        hex4 = node_id.lstrip("!")[-4:].upper()
         return MeshNode(
             node_id=node_id,
-            long_name=user.get("longName", "Unknown"),
-            short_name=user.get("shortName", "????"),
+            long_name=_clean_name(user.get("longName", "Unknown"), f"node-{hex4.lower()}"),
+            short_name=_clean_name(user.get("shortName", "????"), "????"),
             latitude=lat,
             longitude=lon,
             altitude=pos.get("altitude") if pos.get("altitude") is not None else None,
@@ -1522,6 +2167,17 @@ class MeshLoungeApp(App):
                     self._rx_position(packet, decoded)
                 elif portnum == "NODEINFO_APP":
                     self._rx_nodeinfo(packet, decoded)
+                elif portnum == "TRACEROUTE_APP":
+                    self._rx_traceroute(packet, decoded)
+                # Every packet (any port) registers RF activity for the map + waterfall
+                from_id = f"!{packet.get('from', 0):08x}"
+                self._record_rf(from_id, packet.get("rxSnr"))
+                self._capture_packet(
+                    from_id, f"!{packet.get('to', 0xFFFFFFFF):08x}", portnum,
+                    packet.get("rxSnr"), packet.get("rxRssi"),
+                    len(decoded.get("payload", b"") or b""),
+                    max(0, packet.get("hopStart", 0) - packet.get("hopLimit", 0)),
+                )
             except Exception as e:
                 self._sys(f"[red]rx error:[/red] {e}")
         self.call_from_thread(process)
@@ -1536,6 +2192,7 @@ class MeshLoungeApp(App):
 
         self._ensure_node(from_id)
         node = self.nodes[from_id]
+        self._refresh_name_if_missing(node)
         node.last_heard = time.time()
         node.snr = snr
         node.rssi = rssi
@@ -1543,17 +2200,20 @@ class MeshLoungeApp(App):
         hops = packet.get("hopStart", 0) - packet.get("hopLimit", 0)
         # Use rxTime (when the device received it) rather than wall-clock now
         rx_time = packet.get("rxTime") or time.time()
+        is_dm = (to_id != "!ffffffff")
         self._add_message(MeshMessage(
             timestamp=rx_time,
             sender_id=from_id,
-            sender_name=node.short_name,
+            sender_name=self._display_name(node),
             text=text,
             channel=channel,
-            is_dm=(to_id != "!ffffffff"),
+            is_dm=is_dm,
             snr=snr,
             rssi=rssi,
             hops=max(0, hops),
         ))
+        if is_dm:
+            self._alert(f"✉ direct message from {self._display_name(node)}", bell=True)
 
     def _rx_telemetry(self, packet: dict, decoded: dict) -> None:
         from_id = f"!{packet.get('from', 0):08x}"
@@ -1588,10 +2248,13 @@ class MeshLoungeApp(App):
         user = decoded.get("user", {})
         self._ensure_node(from_id)
         n = self.nodes[from_id]
-        n.long_name = user.get("longName", n.long_name)
-        n.short_name = user.get("shortName", n.short_name)
+        hex4 = from_id.lstrip("!")[-4:].upper()
+        before = (n.short_name, n.long_name)
+        n.long_name = _clean_name(user.get("longName", n.long_name), f"node-{hex4.lower()}")
+        n.short_name = _clean_name(user.get("shortName", n.short_name), "????")
         n.last_heard = time.time()
-        self._sys(f"node info: [{n.short_name}] [cyan]{n.long_name}[/cyan]")
+        if (n.short_name, n.long_name) != before:  # don't spam on periodic re-broadcasts
+            self._sys(f"node info: [{n.short_name}] [#7ba9a0]{n.long_name}[/#7ba9a0]")
 
     # ── Input Handling ────────────────────────────────────────────────────────
 
@@ -1627,24 +2290,32 @@ class MeshLoungeApp(App):
             self._cmd_dm(parts[1], " ".join(parts[2:]))
         elif cmd == "/select" and len(parts) >= 2:
             self._cmd_select(parts[1])
+        elif cmd == "/trace" and len(parts) >= 2:
+            self._cmd_trace(parts[1])
+        elif cmd == "/alerts":
+            self._cmd_alerts(parts[1] if len(parts) >= 2 else "")
         else:
-            self._sys(f"[red]unknown command:[/red] {cmd}  (try [cyan]/help[/cyan])")
+            self._sys(f"[red]unknown command:[/red] {cmd}  (try [#7ba9a0]/help[/#7ba9a0])")
 
     def _cmd_help(self) -> None:
         lines = [
             "━" * 55,
-            "  [bold bright_green]instant_meshenger COMMANDS[/bold bright_green]",
+            "  [bold #a7c189]instant_meshenger COMMANDS[/bold #a7c189]",
             "━" * 55,
-            "  [cyan]/help[/cyan]                 this help screen",
-            "  [cyan]/nodes[/cyan]                list all known nodes",
-            "  [cyan]/info[/cyan]                 my node info & telemetry",
-            "  [cyan]/map[/cyan]                  show GPS coordinates of all nodes",
-            "  [cyan]/dm <node> <msg>[/cyan]      direct message (name or !id)",
-            "  [cyan]/channel <0-7>[/cyan]        switch channel",
-            "  [cyan]/select <node>[/cyan]        focus telemetry on a node",
-            "  [cyan]/clear[/cyan]                clear message feed",
+            "  [#7ba9a0]/help[/#7ba9a0]                 this help screen",
+            "  [#7ba9a0]/nodes[/#7ba9a0]                list all known nodes",
+            "  [#7ba9a0]/info[/#7ba9a0]                 my node info & telemetry",
+            "  [#7ba9a0]/map[/#7ba9a0]                  show GPS coordinates of all nodes",
+            "  [#7ba9a0]/dm <node> <msg>[/#7ba9a0]      direct message (name or !id)",
+            "  [#7ba9a0]/channel <0-7>[/#7ba9a0]        switch channel",
+            "  [#7ba9a0]/select <node>[/#7ba9a0]        focus telemetry on a node",
+            "  [#7ba9a0]/trace <node>[/#7ba9a0]         traceroute — animates the path on the map",
+            "  [#7ba9a0]/alerts [on|off][/#7ba9a0]      toggle DM / offline / low-battery alerts",
+            "  [#7ba9a0]/clear[/#7ba9a0]                clear message feed",
             "━" * 55,
-            "  node can be short name [cyan]CYPH[/cyan] or full id [cyan]!deadbeef[/cyan]",
+            "  [dim]keys:[/dim] [#7ba9a0]tab[/#7ba9a0] node nav (j/k, ⏎ dm)   "
+            "[#7ba9a0]^g[/#7ba9a0] map view   [#7ba9a0]^l[/#7ba9a0] links   [#7ba9a0]^t[/#7ba9a0] map",
+            "  node can be short name [#7ba9a0]CYPH[/#7ba9a0] or full id [#7ba9a0]!deadbeef[/#7ba9a0]",
         ]
         for line in lines:
             self._sys(line)
@@ -1671,7 +2342,7 @@ class MeshLoungeApp(App):
             return
         self._sys("━" * 55)
         self._sys(f"  [bold]MY NODE[/bold]  {mine.long_name}  [{mine.short_name}]")
-        self._sys(f"  id:      [cyan]{mine.node_id}[/cyan]")
+        self._sys(f"  id:      [#7ba9a0]{mine.node_id}[/#7ba9a0]")
         if mine.latitude is not None:
             self._sys(f"  pos:     {mine.latitude:.5f}°, {mine.longitude:.5f}°")
         if mine.altitude is not None:
@@ -1683,7 +2354,7 @@ class MeshLoungeApp(App):
             self._sys(f"  air tx:  {mine.air_util_tx:.1f}%")
         if mine.channel_util is not None:
             self._sys(f"  ch util: {mine.channel_util:.1f}%")
-        self._sys(f"  channel: [cyan]{CHANNEL_NAMES[self.current_channel]}[/cyan] ({self.current_channel})")
+        self._sys(f"  channel: [#7ba9a0]{CHANNEL_NAMES[self.current_channel]}[/#7ba9a0] ({self.current_channel})")
         self._sys("━" * 55)
 
     def _cmd_map(self) -> None:
@@ -1702,7 +2373,7 @@ class MeshLoungeApp(App):
             ch = int(ch_str)
             if 0 <= ch <= 7:
                 self.current_channel = ch
-                self._sys(f"switched to channel [cyan]{ch}[/cyan] ({CHANNEL_NAMES[ch]})")
+                self._sys(f"switched to channel [#7ba9a0]{ch}[/#7ba9a0] ({CHANNEL_NAMES[ch]})")
             else:
                 self._sys("[red]channel must be 0–7[/red]")
         except ValueError:
@@ -1741,7 +2412,94 @@ class MeshLoungeApp(App):
             self._sys(f"[red]node not found:[/red] {target}")
             return
         self._selected_node = node.node_id
-        self._sys(f"telemetry focused on [cyan]{node.long_name}[/cyan]")
+        self._sys(f"telemetry focused on [#7ba9a0]{node.long_name}[/#7ba9a0]")
+
+    def _cmd_alerts(self, arg: str) -> None:
+        arg = arg.strip().lower()
+        if arg in ("on", "off"):
+            self._alerts_on = (arg == "on")
+        else:
+            self._alerts_on = not self._alerts_on
+        self._sys(f"alerts [#7ba9a0]{'on' if self._alerts_on else 'off'}[/#7ba9a0]")
+
+    # ── Traceroute ────────────────────────────────────────────────────────────
+
+    def _cmd_trace(self, target: str) -> None:
+        node = self._find_node(target)
+        if not node:
+            self._sys(f"[red]node not found:[/red] {target}")
+            return
+        if node.is_mine:
+            self._sys("[yellow]can't trace your own node[/yellow]")
+            return
+        self._sys(f"◌ tracing route to [#7ba9a0]{node.long_name}[/#7ba9a0]...")
+        if self._demo_mode or not self.interface:
+            self._demo_trace(node)
+            return
+        self._trace_pending = node.node_id
+        dest = int(node.node_id.lstrip("!"), 16)
+        ch = self.current_channel
+        name = self._display_name(node)
+
+        def _send():
+            # sendTraceRoute blocks (waitForTraceRoute); keep it off the UI thread.
+            try:
+                self.interface.sendTraceRoute(dest, hopLimit=7, channelIndex=ch)
+                # If a reply arrived, _rx_traceroute already cleared _trace_pending.
+                self.call_from_thread(self._trace_no_reply, node.node_id, name)
+            except Exception as e:
+                self.call_from_thread(self._sys, f"[red]traceroute failed:[/red] {e}")
+                self.call_from_thread(setattr, self, "_trace_pending", None)
+
+        self.run_worker(_send, thread=True)
+
+    def _trace_no_reply(self, node_id: str, name: str) -> None:
+        if self._trace_pending == node_id:   # still pending → no response came back
+            self._sys(f"[yellow]no traceroute reply from {name}[/yellow] — node may be "
+                      f"unreachable, or rate-limited (mesh allows ~1 trace / 30s)")
+            self._trace_pending = None
+
+    def _demo_trace(self, target: MeshNode) -> None:
+        """Synthesize a plausible route through online relays for demo mode."""
+        mine = next((n for n in self.nodes.values() if n.is_mine), None)
+        relays = [n for n in self.nodes.values()
+                  if not n.is_mine and n.is_online and n.node_id != target.node_id]
+        random.shuffle(relays)
+        hops = max(0, min(target.hops_away, len(relays)))
+        route = ([mine.node_id] if mine else [])
+        route += [r.node_id for r in relays[:hops]]
+        route.append(target.node_id)
+        self._show_trace_route(route)
+
+    def _show_trace_route(self, route: List[str]) -> None:
+        # drop consecutive duplicates
+        clean: List[str] = []
+        for nid in route:
+            if not clean or clean[-1] != nid:
+                clean.append(nid)
+        if len(clean) < 2:
+            self._sys("[yellow]traceroute: no route data[/yellow]")
+            return
+        self.query_one("#map-view", MapPanel).set_trace(clean)
+        names = []
+        for nid in clean:
+            n = self.nodes.get(nid)
+            names.append(self._display_name(n) if n else self._unknown_node_name(nid))
+        self._sys("route: [#a7c189]" + " → ".join(names) + f"[/#a7c189]  "
+                  f"([#7ba9a0]{len(clean) - 1}[/#7ba9a0] hops)")
+
+    def _rx_traceroute(self, packet: dict, decoded: dict) -> None:
+        tr = decoded.get("traceroute") or {}
+        route_nums = tr.get("route", []) or []
+        dest_id = f"!{packet.get('from', 0):08x}"
+        mine = next((n for n in self.nodes.values() if n.is_mine), None)
+        route = [mine.node_id] if mine else []
+        route += [f"!{int(num):08x}" for num in route_nums]
+        route.append(dest_id)
+        for nid in route:
+            self._ensure_node(nid)
+        self._show_trace_route(route)
+        self._trace_pending = None
 
     # ── Messaging ─────────────────────────────────────────────────────────────
 
@@ -1764,6 +2522,7 @@ class MeshLoungeApp(App):
             text=text,
             channel=self.current_channel,
         ))
+        self._record_rf(sender_id, mine.snr if mine else None)  # pulse my node on TX
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
